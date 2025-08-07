@@ -1,0 +1,6 @@
+*.pyc
+*.csv
+*.log
+*.parquet
+*.csv
+*.fits
