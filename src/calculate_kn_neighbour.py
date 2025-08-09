@@ -116,8 +116,8 @@ def load_substructures_data(file_path):
 
 def plot_kn_neighbour(args, data, substructures_data=None):
     nbins = args.map_bins
-    x = data['ra']
-    y = data['dec']
+    x = data['ra'][data['separation_k10'] < 0.004]
+    y = data['dec'][data['separation_k10'] < 0.004]
 
     k = gaussian_kde([x, y])
     xi, yi = np.mgrid[x.min():x.max():nbins*1j,
@@ -134,6 +134,8 @@ def plot_kn_neighbour(args, data, substructures_data=None):
                     c=data['separation_k10'], cmap='viridis', s=5)
 
     if substructures_data is not None:
+        if 'id_group_final' in substructures_data.columns:
+            substructures_data = substructures_data[substructures_data['id_group_final'] > -1]
         ax.scatter(substructures_data['RA'], substructures_data['Dec'],
                    color='c', marker='*', label='Substructures', s=25)
 
@@ -160,8 +162,11 @@ if __name__ == "__main__":
         args.input_file, args.output_file, save_output=args.save_output)
 
     # datamap = create_average_map(data)
+    liana_substructures_filename = 'mkw4_substructures.csv'
+    # daniela_substructures_filename = 'MKW4_photz_Nr200_10_07292025.csv'
+    daniela_substructures_filename = 'MKW4_Nr200_10_07282025.csv'
     substructures_file = os.path.join(os.path.dirname(
-        args.input_file), 'mkw4_substructures.csv')
+        args.input_file), daniela_substructures_filename)
     substructures_data = load_substructures_data(substructures_file)
 
-    plot_kn_neighbour(args, data, substructures_data)
+    plot_kn_neighbour(args, data, substructures_data=None)
