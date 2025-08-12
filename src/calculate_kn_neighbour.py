@@ -116,13 +116,21 @@ def load_substructures_data(file_path):
 
 def plot_kn_neighbour(args, data, substructures_data=None):
     nbins = args.map_bins
-    x = data['ra'][data['separation_k10'] < 0.004]
-    y = data['dec'][data['separation_k10'] < 0.004]
+    x = data['ra'][data['separation_k10'] < 0.001]
+    y = data['dec'][data['separation_k10'] < 0.001]
 
     k = gaussian_kde([x, y])
     xi, yi = np.mgrid[x.min():x.max():nbins*1j,
                       y.min():y.max():nbins*1j]
     zi = k(np.vstack([xi.flatten(), yi.flatten()])).reshape(xi.shape)
+
+    splus_colour = data.g_auto - data.r_auto
+    spec_data = data.mag_g - data.mag_r
+    colour_values = splus_colour
+    colour_values[spec_data.notna()] = spec_data[spec_data.notna()]
+    mask = colour_values.notna()
+    mask &= data.separation_k10[spec_data.notna()] < 0.0005
+
     fig = plt.figure(figsize=(10, 8))
     # ax = fig.add_subplot(111, projection='scatter_density')
     ax = fig.add_subplot(111)
@@ -130,16 +138,24 @@ def plot_kn_neighbour(args, data, substructures_data=None):
     #                    c=data['separation_k10'], cmap='autumn', dpi=15, alpha=0.3)
     ax.pcolormesh(xi, yi, zi, cmap='inferno', shading='auto', alpha=0.9)
 
-    cb = ax.scatter(data['ra'], data['dec'],
-                    c=data['separation_k10'], cmap='viridis', s=5)
+    # cb = ax.scatter(data['ra'], data['dec'],
+    #                 c=data['separation_k10'], cmap='viridis', s=5)
 
+    cb = ax.scatter(data['ra'][mask],
+                    data['dec'][mask],
+                    c=colour_values[mask],
+                    s=data['separation_k10'][mask] * 20000,
+                    cmap='cool', lw=0.3)
+    cb.set_clim(0.2, 1.)
     if substructures_data is not None:
         if 'id_group_final' in substructures_data.columns:
             substructures_data = substructures_data[substructures_data['id_group_final'] > -1]
         ax.scatter(substructures_data['RA'], substructures_data['Dec'],
                    color='c', marker='*', label='Substructures', s=25)
 
-    plt.colorbar(cb, label='k-10 Nearest Neighbour Separation')
+    plt.colorbar(cb, label=r'$g - r$')
+    # invert x-axis
+    ax.invert_xaxis()
     plt.xlabel('Right Ascension (deg)')
     plt.ylabel('Declination (deg)')
     # plt.title('k-10 Nearest Neighbours in 3D Space')
@@ -169,4 +185,4 @@ if __name__ == "__main__":
         args.input_file), daniela_substructures_filename)
     substructures_data = load_substructures_data(substructures_file)
 
-    plot_kn_neighbour(args, data, substructures_data=None)
+    plot_kn_neighbour(args, data, substructures_data=substructures_data)
