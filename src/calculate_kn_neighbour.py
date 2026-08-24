@@ -12,6 +12,7 @@ import astropy.units as u
 import matplotlib.pyplot as plt
 from scipy.stats import gaussian_kde
 # import mpl_scatter_density
+from multiprocessing import Pool
 import argparse
 
 
@@ -28,6 +29,8 @@ def parse_args():
                         help="Flag to save the plot of the k-10-nearest neighbours.")
     parser.add_argument("--map_bins", type=int, default=100,
                         help="Number of bins for the map. Default is 100.")
+    parser.add_argument("--np", type=int, default=1,
+                        help="Number of processes to use for parallel processing. Default is 1.")
     return parser.parse_args()
 
 
@@ -62,15 +65,20 @@ def calculate_kn_neighbour(input_file, output_file, save_output=False):
 
         coords = SkyCoord(ra=ra, dec=dec, distance=redshift,
                           frame='icrs', unit=(u.deg, u.deg, u.Mpc))
-        separation_3d = np.zeros(len(coords))
+        # separation_3d = np.zeros(len(coords))
 
-        for i, coord in enumerate(coords):
-            sep2d = coord.separation(coords)
-            sep3d = coord.separation_3d(coords)
-            separation_10th = sorted(sep2d.value * sep3d.value)[11]
-            separation_3d[i] = separation_10th
+        # for i, coord in enumerate(coords):
+        #     sep2d = coord.separation(coords)
+        #     sep3d = coord.separation_3d(coords)
+        #     separation_10th = sorted(sep2d.value * sep3d.value)[11]
+        #     separation_3d[i] = separation_10th
+        with Pool(processes=args.np) as pool:
+            results = pool.starmap(calculate_separation_parallel, [
+                                   (coords, i) for i in range(len(coords))])
 
-        newdf['separation_k10'] = separation_3d
+        # for index, separation_10th in results:
+        #     separation_3d[index] = separation_10th
+        newdf['separation_k10'] = np.array([sep for _, sep in results])
 
         if save_output:
             newdf.to_csv(output_file, index=False)
@@ -79,6 +87,16 @@ def calculate_kn_neighbour(input_file, output_file, save_output=False):
             print("Output not saved. Use --save_output to save the results.")
 
         return newdf
+
+
+def calculate_separation_parallel(coords, index):
+    """Calculate the k-10-nearest neighbour separation for a given index."""
+    coord = coords[index]
+    sep2d = coord.separation(coords)
+    sep3d = coord.separation_3d(coords)
+    separation_10th = sorted(sep2d.value * sep3d.value)[11]
+
+    return index, separation_10th
 
 
 def create_average_map(data):
@@ -109,8 +127,10 @@ def load_substructures_data(file_path):
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"File {file_path} does not exist.")
     data = pd.read_csv(file_path)
-    if 'RA' not in data.columns or 'Dec' not in data.columns:
-        raise ValueError("Input file must contain 'ra' and 'dec' columns.")
+    if 'ra' in data.columns:
+        data.rename(columns={'ra': 'RA', 'dec': 'Dec'}, inplace=True)
+    if ('RA' not in data.columns) or ('Dec' not in data.columns):
+        raise ValueError("Input file must contain 'RA' and 'Dec' columns.")
     return data
 
 
@@ -136,7 +156,8 @@ def plot_kn_neighbour(args, data, substructures_data=None):
     ax = fig.add_subplot(111)
     # ax.scatter_density(data['ra'], data['dec'],
     #                    c=data['separation_k10'], cmap='autumn', dpi=15, alpha=0.3)
-    ax.pcolormesh(xi, yi, zi, cmap='inferno', shading='auto', alpha=0.9)
+    ax.pcolormesh(xi, yi, zi, cmap='inferno',
+                  shading='auto', alpha=0.9, zorder=-10)
 
     # cb = ax.scatter(data['ra'], data['dec'],
     #                 c=data['separation_k10'], cmap='viridis', s=5)
@@ -150,12 +171,15 @@ def plot_kn_neighbour(args, data, substructures_data=None):
     if substructures_data is not None:
         if 'id_group_final' in substructures_data.columns:
             substructures_data = substructures_data[substructures_data['id_group_final'] > -1]
-        ax.scatter(substructures_data['RA'], substructures_data['Dec'],
-                   color='c', marker='*', label='Substructures', s=25)
+        ax.scatter(substructures_data['RA'],
+                   substructures_data['Dec'],
+                   c=substructures_data['A'],
+                   cmap='winter',
+                   marker='*', label='Substructures', s=25, zorder=5)
 
     plt.colorbar(cb, label=r'$g - r$')
     # invert x-axis
-    ax.invert_xaxis()
+    # ax.invert_xaxis()
     plt.xlabel('Right Ascension (deg)')
     plt.ylabel('Declination (deg)')
     # plt.title('k-10 Nearest Neighbours in 3D Space')
@@ -178,11 +202,14 @@ if __name__ == "__main__":
         args.input_file, args.output_file, save_output=args.save_output)
 
     # datamap = create_average_map(data)
-    liana_substructures_filename = 'mkw4_substructures.csv'
+    # liana_substructures_filename = 'mkw4_substructures.csv'
+    liana_substructures_filename = 'MKW4_properties_concat_all_final.csv'
     # daniela_substructures_filename = 'MKW4_photz_Nr200_10_07292025.csv'
     daniela_substructures_filename = 'MKW4_Nr200_10_07282025.csv'
     substructures_file = os.path.join(os.path.dirname(
-        args.input_file), daniela_substructures_filename)
+        args.input_file), liana_substructures_filename)
     substructures_data = load_substructures_data(substructures_file)
 
-    plot_kn_neighbour(args, data, substructures_data=substructures_data)
+    plot_kn_neighbour(
+        # args, data, substructures_data=substructures_data)
+        args, data, substructures_data=None)
