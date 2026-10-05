@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 from . import __version__
 from .config import photoz_settings, resolve_path, tracer_window
@@ -21,6 +22,7 @@ from .photoz_env import make_draws, photoz_environment, summarise
 from .redshift import assign_redshifts, resolve_photoz_params
 
 ESTIMATOR_PARAMS = ("dv", "n_sigma")
+TRACER_SUFFIX = "_tracers.parquet"
 
 
 def _git_head(root):
@@ -95,33 +97,8 @@ def _add_columns(frame, columns):
         frame[col] = values
 
 
-def build(cfg, output=None):
-    """Run the pipeline described by cfg and write the enriched parquet.
-
-    Steps: load catalogue, assign redshifts, resolve the photo-z scatter and
-    bias, compute comoving coordinates, compute each configured environment
-    estimator. Returns the enriched DataFrame; also writes it to 'output'
-    (default: cfg['output']) with a provenance sidecar.
-
-    Tracers come from tracer_window (default: redshift_window); the rows of
-    the output and the targets are the galaxies with z_best inside
-    redshift_window. Spec-z targets are measured at their position, excluding
-    themselves. Photo-z targets are measured at each of n_draws redshift
-    draws (config 'photoz'); only draws inside redshift_window are kept. For
-    every estimator quantity <col> the column holds the median over the kept
-    draws for photo-z rows, <col>_lo and <col>_hi the 16th and 84th
-    percentiles (all equal to the value for spec-z rows), and p_in_window is
-    the fraction of draws inside the window (1.0 for spec-z rows).
-
-    If the config has a 'photometry' section the steps of phase 3 follow, in
-    this order: stellar masses (knn.mass; photo-z rows carry the median and
-    the 16th and 84th percentiles over the same redshift draws as the
-    environment), mass-weighted environment entries (weight: mass; their
-    tracers are the tracers that have a mass, columns '<q>_<name>_k<k>_mass'),
-    colours and indicators (knn.indicators), 'joins' (knn.joins) and
-    'cluster' phase space (knn.phasespace). An environment entry with
-    photoz_mode 'none' leaves its photo-z rows NaN.
-    """
+def _run(cfg):
+    """Run the pipeline of build; returns (enriched, tracer_table, build_info)."""
     df = load_catalogue(resolve_path(cfg, cfg["catalogue"]), cfg["columns"])
     df = assign_redshifts(df, cfg["redshift_window"])
     window = cfg["redshift_window"]
@@ -252,9 +229,6 @@ def build(cfg, output=None):
         _add_columns(out, ps_cols)
         extra_info["phase_space"] = ps_info
 
-    out_path = Path(output) if output is not None else resolve_path(cfg, cfg["output"])
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out.to_parquet(out_path, index=False)
     build_info = {
         "n_tracers": int(is_tracer.sum()),
         "n_spec_targets": int(len(spec_rows)),
@@ -263,5 +237,73 @@ def build(cfg, output=None):
         "photoz": {**settings, **params},
         **extra_info,
     }
+    out_row = np.where(in_window, np.cumsum(in_window) - 1, -1)
+    logm_tracer = (logm_point[is_tracer] if logm_point is not None
+                   else np.full(int(is_tracer.sum()), np.nan))
+    tracer_table = pd.DataFrame({
+        "ra": full["ra"].to_numpy()[is_tracer], "dec": full["dec"].to_numpy()[is_tracer],
+        "z_best": full["z_best"].to_numpy()[is_tracer],
+        "z_type": full["z_type"].to_numpy()[is_tracer],
+        "cx": xyz[is_tracer, 0], "cy": xyz[is_tracer, 1], "cz": xyz[is_tracer, 2],
+        "logm_point": logm_tracer, "out_row": out_row[is_tracer],
+    })
+    return out, tracer_table, build_info
+
+
+def tracers_path(output):
+    """Path of the tracer table written next to the enriched catalogue."""
+    output = Path(output)
+    return output.with_name(output.stem + TRACER_SUFFIX)
+
+
+def build_in_memory(cfg):
+    """Run the pipeline without writing anything.
+
+    Returns (enriched DataFrame, tracer table). The tracer table has one row
+    per tracer (ra, dec, z_best, z_type, cx, cy, cz, logm_point = log mass at
+    z_best or NaN, out_row = row of the tracer in the enriched DataFrame, -1
+    if it lies outside redshift_window); the explorer (knn.explorer) needs it
+    to recompute environments.
+    """
+    out, tracer_table, _ = _run(cfg)
+    return out, tracer_table
+
+
+def build(cfg, output=None):
+    """Run the pipeline described by cfg and write the enriched parquet.
+
+    The tracer table (see build_in_memory) is written to <output stem>_tracers.parquet.
+
+    Steps: load catalogue, assign redshifts, resolve the photo-z scatter and
+    bias, compute comoving coordinates, compute each configured environment
+    estimator. Returns the enriched DataFrame; also writes it to 'output'
+    (default: cfg['output']) with a provenance sidecar.
+
+    Tracers come from tracer_window (default: redshift_window); the rows of
+    the output and the targets are the galaxies with z_best inside
+    redshift_window. Spec-z targets are measured at their position, excluding
+    themselves. Photo-z targets are measured at each of n_draws redshift
+    draws (config 'photoz'); only draws inside redshift_window are kept. For
+    every estimator quantity <col> the column holds the median over the kept
+    draws for photo-z rows, <col>_lo and <col>_hi the 16th and 84th
+    percentiles (all equal to the value for spec-z rows), and p_in_window is
+    the fraction of draws inside the window (1.0 for spec-z rows).
+
+    If the config has a 'photometry' section the steps of phase 3 follow, in
+    this order: stellar masses (knn.mass; photo-z rows carry the median and
+    the 16th and 84th percentiles over the same redshift draws as the
+    environment), mass-weighted environment entries (weight: mass; their
+    tracers are the tracers that have a mass, columns '<q>_<name>_k<k>_mass'),
+    colours and indicators (knn.indicators), 'joins' (knn.joins) and
+    'cluster' phase space (knn.phasespace). An environment entry with
+    photoz_mode 'none' leaves its photo-z rows NaN.
+    """
+    out, tracer_table, build_info = _run(cfg)
+    out_path = Path(output) if output is not None else resolve_path(cfg, cfg["output"])
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out.to_parquet(out_path, index=False)
+    tracer_file = tracers_path(out_path)
+    tracer_table.to_parquet(tracer_file, index=False)
+    build_info["tracers_file"] = tracer_file.name
     write_provenance(cfg, out_path, build_info)
     return out

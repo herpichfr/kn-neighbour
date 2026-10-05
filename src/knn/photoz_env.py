@@ -56,6 +56,32 @@ def make_draws(df, mode, settings, params, window, cosmo):
                    comoving_xyz(ra, dec, z, cosmo), p_in_window)
 
 
+def nanpercentiles(matrix, percentiles=PERCENTILES):
+    """np.nanpercentile(matrix, percentiles, axis=1), vectorised over the rows.
+
+    Sorts each row once (NaN last) and interpolates linearly like numpy's
+    default method, so it is much faster than np.nanpercentile when rows
+    have NaN. Returns (len(percentiles), N); a row with no finite value gives NaN.
+    """
+    matrix = np.asarray(matrix, dtype=float)
+    n_row = len(matrix)
+    srt = np.sort(matrix, axis=1)
+    count = (~np.isnan(matrix)).sum(axis=1)
+    rows = np.arange(n_row)
+    out = np.full((len(percentiles), n_row), np.nan)
+    ok = count > 0
+    for j, q in enumerate(percentiles):
+        virtual = (count - 1) * (q / 100.0)
+        below = np.where(ok, np.floor(virtual), 0).astype(int)
+        above = np.where(ok, np.minimum(below + 1, count - 1), 0)
+        frac = virtual - below
+        a, b = srt[rows, below], srt[rows, above]
+        diff = b - a
+        value = np.where(frac >= 0.5, b - diff * (1.0 - frac), a + diff * frac)
+        out[j] = np.where(ok, value, np.nan)
+    return out
+
+
 def summarise(values, draws):
     """Per galaxy 16th, 50th and 84th percentile of values over its kept draws.
 
@@ -66,7 +92,7 @@ def summarise(values, draws):
     matrix[draws.inside] = values
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
-        lo, med, hi = np.nanpercentile(matrix, PERCENTILES, axis=1)
+        lo, med, hi = nanpercentiles(matrix, PERCENTILES)
     return lo, med, hi
 
 

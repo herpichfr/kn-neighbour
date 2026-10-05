@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-app = ["dash", "plotly"]
+app = ["dash", "plotly", "matplotlib"]
 dust = ["sfdmap"]
 test = ["pytest"]
 
@@ -30,6 +30,9 @@ version = { attr = "knn.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"knn.app" = ["assets/*.css"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

@@ -24,7 +24,9 @@ ENVIRONMENT_KEYS = ("name", "k", "dv", "n_sigma", "photoz_mode", "weight")
 ENTRY_PHOTOZ_MODES = PHOTOZ_MODES + ("none",)
 WEIGHTS = ("count", "mass")
 OPTIONAL_SECTIONS = ("photometry", "extinction", "kcorrection", "mass", "indicators",
-                     "joins", "cluster")
+                     "joins", "cluster", "app")
+# explorer (knn serve): minimum number of galaxies in a trend bin, else the bin is empty
+APP_DEFAULTS = {"min_per_bin": 10}
 JOIN_KEYS = ("name", "path", "columns", "prefix", "ra", "dec", "radius_arcsec",
              "unescape_latex", "int_columns")
 
@@ -207,11 +209,17 @@ def _validate_cluster(sec, cfg):
                           "from 'cluster.ra' and 'cluster.dec'")
 
 
+def _validate_app(sec, cfg):
+    _section(sec, "app", APP_DEFAULTS)
+    if "min_per_bin" in sec and (not _is_int(sec["min_per_bin"]) or sec["min_per_bin"] < 1):
+        raise ConfigError("'app.min_per_bin' must be an integer >= 1")
+
+
 _SECTION_VALIDATORS = {
     "photometry": _validate_photometry, "extinction": _validate_extinction,
     "kcorrection": _validate_kcorrection, "mass": _validate_mass,
     "indicators": _validate_indicators, "joins": _validate_joins,
-    "cluster": _validate_cluster,
+    "cluster": _validate_cluster, "app": _validate_app,
 }
 
 
@@ -329,6 +337,11 @@ def load_config(path):
 def photoz_settings(cfg):
     """The 'photoz' section with defaults filled in (PHOTOZ_DEFAULTS)."""
     return {**PHOTOZ_DEFAULTS, **(cfg.get("photoz") or {})}
+
+
+def app_settings(cfg):
+    """The 'app' section with defaults filled in (APP_DEFAULTS)."""
+    return {**APP_DEFAULTS, **(cfg.get("app") or {})}
 
 
 def tracer_window(cfg):

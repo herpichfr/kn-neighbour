@@ -1,10 +1,15 @@
 """Projected k-th neighbour surface density in a redshift slice."""
 
 import numpy as np
+from scipy.spatial import cKDTree
 
 from . import register, tracer_masses
 
 C_KMS = 299792.458
+# kth_angular_neighbours uses the candidate search below from this many targets on
+FAST_MIN_TARGETS = 2000
+FAST_MAX_CANDIDATES = 4096
+FAST_BLOCK = 1_000_000          # candidates (targets x m) handled per block
 
 
 def slice_half_width(z, is_phot, dv, n_sigma, sigma):
@@ -30,7 +35,54 @@ def _unit_vectors(ra, dec):
     return np.column_stack([np.cos(dec) * np.cos(ra), np.cos(dec) * np.sin(ra), np.sin(dec)])
 
 
-def kth_angular_neighbours(tracers, targets, half_width, k, self_index=None, tracer_mass=None):
+def _kth_by_candidates(unit, mass_sorted, target_unit, lo, hi, self_pos, k, cos_k, mass_k, done):
+    """Fill cos_k and mass_k of the targets for which the m nearest tracers suffice.
+
+    The m angularly nearest tracers of a target (k-d tree on the unit
+    vectors) are filtered to its slice [lo, hi) minus itself. When at least k
+    of them remain, their k-th largest cosine is exactly the k-th of the
+    whole slice: a slice tracer closer than it would rank among the m nearest
+    too. Targets that do not get k are retried with 4 times more candidates
+    up to FAST_MAX_CANDIDATES and then left to the caller (done stays False).
+    """
+    n_tracer = len(unit)
+    in_slice = (hi - lo) - ((self_pos >= lo) & (self_pos < hi))
+    todo = np.flatnonzero(np.isfinite(target_unit).all(axis=1) & (in_slice >= k))
+    if len(todo) == 0:
+        return
+    tree = cKDTree(unit)
+    m = min(n_tracer, 8 * k + 8)
+    while len(todo):
+        block = max(1, FAST_BLOCK // m)
+        retry = []
+        for start in range(0, len(todo), block):
+            sel = todo[start:start + block]
+            _, idx = tree.query(target_unit[sel], k=m, workers=-1)
+            idx = np.asarray(idx).reshape(len(sel), m)
+            cos = np.einsum("ijk,ik->ij", unit[idx], target_unit[sel])
+            ok = ((idx >= lo[sel, None]) & (idx < hi[sel, None])
+                  & (idx != self_pos[sel, None]))
+            enough = ok.sum(axis=1) >= k
+            retry.append(sel[~enough])
+            if not enough.any():
+                continue
+            cos = np.where(ok, cos, -np.inf)[enough]
+            idx, rows = idx[enough], sel[enough]
+            if mass_sorted is None:
+                cos_k[rows] = np.partition(cos, m - k, axis=1)[:, m - k]
+            else:
+                nearest = np.argpartition(cos, m - k, axis=1)[:, m - k:]
+                cos_k[rows] = np.take_along_axis(cos, nearest, axis=1).min(axis=1)
+                mass_k[rows] = mass_sorted[np.take_along_axis(idx, nearest, axis=1)].sum(axis=1)
+            done[rows] = True
+        todo = np.concatenate(retry)
+        if m >= min(n_tracer, FAST_MAX_CANDIDATES):
+            break
+        m = min(n_tracer, FAST_MAX_CANDIDATES, 4 * m)
+
+
+def kth_angular_neighbours(tracers, targets, half_width, k, self_index=None, tracer_mass=None,
+                           fast=None):
     """Angular separation (radians) to the k-th nearest tracer in a slice, and
     the summed mass of the k nearest tracers.
 
@@ -41,8 +93,12 @@ def kth_angular_neighbours(tracers, targets, half_width, k, self_index=None, tra
     which case the mass sum is NaN.
 
     Tracers are sorted by redshift once and each slice is found with
-    searchsorted; the angular distances of one target are computed at once
-    for the whole slice.
+    searchsorted. Targets are first handled by a nearest-candidates search
+    (_kth_by_candidates: exact, same result up to rounding of the cosines)
+    when fast is True, or None and there are at least FAST_MIN_TARGETS
+    targets; the remaining targets (and all of them with fast=False) are
+    handled one at a time, the angular distances of a target computed at
+    once for the whole slice.
 
     Returns (theta_k, mass_k), each (M,).
     """
@@ -68,7 +124,15 @@ def kth_angular_neighbours(tracers, targets, half_width, k, self_index=None, tra
 
     cos_k = np.full(n_target, np.nan)
     mass_k = np.full(n_target, np.nan)
+    done = np.zeros(n_target, dtype=bool)
+    if fast is None:
+        fast = n_target >= FAST_MIN_TARGETS
+    if fast:
+        _kth_by_candidates(unit, mass_sorted, target_unit, lo, hi, self_pos, k, cos_k, mass_k,
+                           done)
     for i in range(n_target):
+        if done[i]:
+            continue
         a, b = lo[i], hi[i]
         n = b - a
         if n < k:
