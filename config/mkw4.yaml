@@ -1,0 +1,29 @@
+# Paths are resolved relative to the repository root (the parent of config/),
+# not the current working directory.
+catalogue: data/MKW4+v7.parquet
+
+# canonical name: column name in the catalogue
+columns:
+  ra: ra
+  dec: dec
+  z_spec: z
+  z_spec_err: z_err
+  z_phot: zml
+  z_phot_odds: odds
+
+# flat LambdaCDM
+cosmology:
+  H0: 70
+  Om0: 0.3
+
+# open interval: z_lo < z_best < z_hi
+redshift_window: [0.007, 0.037]
+
+# 'spec' = spec-z galaxies trace the density field, 'all' = every galaxy in the window
+tracers: spec
+
+environment:
+  - name: knn3d
+    k: 10
+
+output: data/derived/MKW4_enriched.parquet

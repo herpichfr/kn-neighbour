@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kn-neighbour"
+dynamic = ["version"]
+description = "Environment (k-th nearest neighbour) measures for galaxy catalogues"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pandas",
+    "scipy",
+    "astropy",
+    "pyarrow",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+app = ["dash", "plotly"]
+test = ["pytest"]
+
+[project.scripts]
+knn = "knn.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "knn.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

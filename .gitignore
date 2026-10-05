@@ -4,3 +4,4 @@
 *.parquet
 *.csv
 *.fits
+data/derived/
