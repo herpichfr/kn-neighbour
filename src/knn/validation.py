@@ -154,6 +154,8 @@ def validate_photoz(cfg, output_dir=None):
     draws = {mode: make_draws(vdf, mode, settings, params, window, cosmo)
              for mode in PHOTOZ_MODES}
     for entry in cfg["environment"]:
+        if entry.get("weight", "count") == "mass":
+            continue    # needs tracer stellar masses; only the count estimators are validated
         name, k = entry["name"], entry["k"]
         estimator = get_estimator(name)
         extra = {key: entry[key] for key in ESTIMATOR_PARAMS if key in entry}

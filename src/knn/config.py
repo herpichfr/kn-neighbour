@@ -5,6 +5,11 @@ from pathlib import Path
 
 import yaml
 
+from .indicators import INDICATOR_DEFAULTS
+from .mass import MASS_DEFAULTS, METHODS
+from .phasespace import CLUSTER_KEYS
+from .photometry import (EXTINCTION_DEFAULTS, KCORRECTION_DEFAULTS, PHOTOMETRY_DEFAULTS,
+                         PHOTOMETRY_SETS)
 from .redshift import PHOTOZ_MODES
 
 REQUIRED_KEYS = ("catalogue", "columns", "cosmology", "redshift_window",
@@ -14,7 +19,14 @@ OPTIONAL_COLUMNS = ("z_spec_err", "z_phot_odds")
 TRACER_CHOICES = ("spec", "all")
 PHOTOZ_DEFAULTS = {"mode": "gauss", "n_draws": 200, "seed": 42,
                    "pdf_max_std": 0.5, "sigma": None, "bias": None}
-ENVIRONMENT_KEYS = ("name", "k", "dv", "n_sigma", "photoz_mode")
+ENVIRONMENT_KEYS = ("name", "k", "dv", "n_sigma", "photoz_mode", "weight")
+# per-entry photoz_mode: 'none' leaves the photo-z rows NaN
+ENTRY_PHOTOZ_MODES = PHOTOZ_MODES + ("none",)
+WEIGHTS = ("count", "mass")
+OPTIONAL_SECTIONS = ("photometry", "extinction", "kcorrection", "mass", "indicators",
+                     "joins", "cluster")
+JOIN_KEYS = ("name", "path", "columns", "prefix", "ra", "dec", "radius_arcsec",
+             "unescape_latex", "int_columns")
 
 
 class ConfigError(ValueError):
@@ -55,6 +67,152 @@ def _validate_photoz(photoz):
         raise ConfigError("'photoz.sigma' must be a number > 0 or null")
     if photoz.get("bias") is not None and not _is_number(photoz["bias"]):
         raise ConfigError("'photoz.bias' must be a number or null")
+
+
+def _section(value, key, allowed):
+    if not isinstance(value, dict):
+        raise ConfigError(f"'{key}' must be a mapping")
+    for name in value:
+        if name not in allowed:
+            raise ConfigError(f"unknown key '{key}.{name}'")
+
+
+def _check_pair(value, key):
+    if (not isinstance(value, (list, tuple)) or len(value) != 2
+            or not all(_is_number(v) for v in value) or not value[0] < value[1]):
+        raise ConfigError(f"'{key}' must be [lo, hi] with lo < hi")
+
+
+def _validate_photometry(sec, cfg):
+    _section(sec, "photometry", PHOTOMETRY_DEFAULTS)
+    custom = sec.get("sets")
+    if custom is not None:
+        if not isinstance(custom, dict):
+            raise ConfigError("'photometry.sets' must be a mapping")
+        for name, spec in custom.items():
+            if (not isinstance(spec, dict) or spec.get("system") not in ("sdss", "decam")
+                    or not isinstance(spec.get("bands"), dict)):
+                raise ConfigError(f"'photometry.sets.{name}' needs 'system' (sdss | decam) "
+                                  "and a 'bands' mapping band -> column")
+    known = set(PHOTOMETRY_SETS) | set(custom or {})
+    for key in ("set", "ur_set", "wise_set"):
+        if sec.get(key, PHOTOMETRY_DEFAULTS[key]) not in known:
+            raise ConfigError(f"'photometry.{key}' must be one of {sorted(known)}")
+    if sec.get("wise_system", "ab") not in ("ab", "vega"):
+        raise ConfigError("'photometry.wise_system' must be 'ab' or 'vega'")
+    if "missing_above" in sec and (not _is_number(sec["missing_above"])
+                                   or sec["missing_above"] <= 0):
+        raise ConfigError("'photometry.missing_above' must be a number > 0")
+
+
+def _validate_extinction(sec, cfg):
+    _section(sec, "extinction", EXTINCTION_DEFAULTS)
+    ebv = sec.get("ebv")
+    if ebv is not None and (not isinstance(ebv, str) or not ebv):
+        raise ConfigError("'extinction.ebv' must be null, 'sfd' or a column name")
+    if sec.get("sfd_dir") is not None and not isinstance(sec["sfd_dir"], str):
+        raise ConfigError("'extinction.sfd_dir' must be a path string or null")
+    coeffs = sec.get("coefficients")
+    if coeffs is not None and (not isinstance(coeffs, dict)
+                               or not all(_is_number(v) for v in coeffs.values())):
+        raise ConfigError("'extinction.coefficients' must map band -> A/E(B-V) or be null")
+
+
+def _validate_kcorrection(sec, cfg):
+    _section(sec, "kcorrection", KCORRECTION_DEFAULTS)
+    if "apply" in sec and not isinstance(sec["apply"], bool):
+        raise ConfigError("'kcorrection.apply' must be true or false")
+
+
+def _validate_mass(sec, cfg):
+    _section(sec, "mass", MASS_DEFAULTS)
+    if sec.get("method", "taylor") not in METHODS:
+        raise ConfigError(f"'mass.method' must be one of {METHODS}")
+    if sec.get("fallback") is not None and sec["fallback"] not in METHODS:
+        raise ConfigError(f"'mass.fallback' must be null or one of {METHODS}")
+    limits = sec.get("colour_limits")
+    if limits is not None:
+        _section(limits, "mass.colour_limits", MASS_DEFAULTS["colour_limits"])
+        for name, pair in limits.items():
+            _check_pair(pair, f"mass.colour_limits.{name}")
+
+
+def _validate_indicators(sec, cfg):
+    _section(sec, "indicators", INDICATOR_DEFAULTS)
+    rs = sec.get("red_sequence")
+    if rs is not None:
+        _section(rs, "indicators.red_sequence", INDICATOR_DEFAULTS["red_sequence"])
+        if rs.get("mass_range") is not None:
+            _check_pair(rs["mass_range"], "indicators.red_sequence.mass_range")
+        if "clip" in rs and (not isinstance(rs["clip"], (list, tuple)) or len(rs["clip"]) != 2
+                             or not all(_is_number(c) and c > 0 for c in rs["clip"])):
+            raise ConfigError("'indicators.red_sequence.clip' must be two numbers > 0")
+        for name in ("pivot", "bin_width", "n_sigma_quench"):
+            if name in rs and not _is_number(rs[name]):
+                raise ConfigError(f"'indicators.red_sequence.{name}' must be a number")
+        for name in ("min_per_bin", "max_iter"):
+            if name in rs and (not _is_int(rs[name]) or rs[name] < 1):
+                raise ConfigError(f"'indicators.red_sequence.{name}' must be an integer >= 1")
+    if "w2w3_sf_threshold" in sec and not _is_number(sec["w2w3_sf_threshold"]):
+        raise ConfigError("'indicators.w2w3_sf_threshold' must be a number")
+
+
+def _validate_joins(sec, cfg):
+    if not isinstance(sec, list):
+        raise ConfigError("'joins' must be a list")
+    names = set()
+    for i, entry in enumerate(sec):
+        if not isinstance(entry, dict):
+            raise ConfigError(f"'joins[{i}]' must be a mapping")
+        for key in entry:
+            if key not in JOIN_KEYS:
+                raise ConfigError(f"unknown key 'joins[{i}].{key}'")
+        for key in ("name", "path", "columns"):
+            if key not in entry:
+                raise ConfigError(f"missing required key 'joins[{i}].{key}'")
+        for key in ("name", "path"):
+            if not isinstance(entry[key], str) or not entry[key]:
+                raise ConfigError(f"'joins[{i}].{key}' must be a non-empty string")
+        if entry["name"] in names:
+            raise ConfigError(f"'joins[{i}].name' {entry['name']!r} is used twice")
+        names.add(entry["name"])
+        cols = entry["columns"]
+        ok = (isinstance(cols, list) and cols and all(isinstance(c, str) for c in cols)) or (
+            isinstance(cols, dict) and cols
+            and all(isinstance(k, str) and isinstance(v, str) for k, v in cols.items()))
+        if not ok:
+            raise ConfigError(f"'joins[{i}].columns' must be a non-empty list of column "
+                              "names or a mapping column -> output name")
+        if "radius_arcsec" in entry and (not _is_number(entry["radius_arcsec"])
+                                         or entry["radius_arcsec"] <= 0):
+            raise ConfigError(f"'joins[{i}].radius_arcsec' must be a number > 0")
+        if "unescape_latex" in entry and not isinstance(entry["unescape_latex"], bool):
+            raise ConfigError(f"'joins[{i}].unescape_latex' must be true or false")
+        if "int_columns" in entry and not isinstance(entry["int_columns"], list):
+            raise ConfigError(f"'joins[{i}].int_columns' must be a list")
+
+
+def _validate_cluster(sec, cfg):
+    _section(sec, "cluster", CLUSTER_KEYS)
+    for key, value in sec.items():
+        if value is not None and not _is_number(value):
+            raise ConfigError(f"'cluster.{key}' must be a number or null")
+    for key in ("r200_mpc", "sigma_v"):
+        if sec.get(key) is not None and sec[key] <= 0:
+            raise ConfigError(f"'cluster.{key}' must be > 0")
+    if (sec.get("ra") is None) != (sec.get("dec") is None):
+        raise ConfigError("'cluster.ra' and 'cluster.dec' must be given together")
+    if sec.get("ra") is not None and sec.get("z") is None:
+        raise ConfigError("'cluster.z' is needed to compute the projected radius "
+                          "from 'cluster.ra' and 'cluster.dec'")
+
+
+_SECTION_VALIDATORS = {
+    "photometry": _validate_photometry, "extinction": _validate_extinction,
+    "kcorrection": _validate_kcorrection, "mass": _validate_mass,
+    "indicators": _validate_indicators, "joins": _validate_joins,
+    "cluster": _validate_cluster,
+}
 
 
 def validate_config(cfg):
@@ -129,9 +287,19 @@ def validate_config(cfg):
         for name in ("dv", "n_sigma"):
             if name in entry and (not _is_number(entry[name]) or entry[name] <= 0):
                 raise ConfigError(f"'environment[{i}].{name}' must be a number > 0")
-        if entry.get("photoz_mode", "point") not in PHOTOZ_MODES:
+        if entry.get("photoz_mode", "point") not in ENTRY_PHOTOZ_MODES:
             raise ConfigError(
-                f"'environment[{i}].photoz_mode' must be one of {PHOTOZ_MODES}")
+                f"'environment[{i}].photoz_mode' must be one of {ENTRY_PHOTOZ_MODES}")
+        if entry.get("weight", "count") not in WEIGHTS:
+            raise ConfigError(f"'environment[{i}].weight' must be one of {WEIGHTS}")
+        if entry.get("weight") == "mass" and not cfg.get("photometry"):
+            raise ConfigError(
+                f"'environment[{i}].weight' is 'mass': needs a 'photometry' section "
+                "(the stellar masses of the tracers)")
+
+    for key in OPTIONAL_SECTIONS:
+        if key in cfg and cfg[key] is not None:
+            _SECTION_VALIDATORS[key](cfg[key], cfg)
 
 
 def load_config(path):

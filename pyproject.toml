@@ -19,6 +19,7 @@ dependencies = [
 
 [project.optional-dependencies]
 app = ["dash", "plotly"]
+dust = ["sfdmap"]
 test = ["pytest"]
 
 [project.scripts]

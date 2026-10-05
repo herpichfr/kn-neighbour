@@ -31,7 +31,8 @@ tracers: spec
 # Environment of photo-z-only galaxies, measured against the tracers at
 # n_draws redshift draws per galaxy. The output columns hold the median over
 # the draws inside redshift_window (<col>_lo, <col>_hi: 16th and 84th
-# percentiles; p_in_window: fraction of draws inside the window).
+# percentiles; p_in_window: fraction of draws inside the window). The stellar
+# masses of photo-z galaxies use the same draws.
 photoz:
   mode: gauss       # point: z_phot | gauss: N(z_phot - bias (1+z), sigma (1+z)) | pdf: catalogue mixture
   n_draws: 200
@@ -40,15 +41,113 @@ photoz:
   sigma: null       # null = measure on galaxies with spec-z in the window and a photo-z
   bias: null        # idem; sigma and bias are in units of (z_phot - z_spec)/(1 + z_spec)
 
-# Optional per-entry keys: photoz_mode (point | gauss | pdf, overrides photoz.mode
-# for that estimator), and for sigma2d: dv (km/s, spec-z slice half-width,
+# Optional per-entry keys: photoz_mode (point | gauss | pdf | none, overrides
+# photoz.mode for that estimator; none leaves the photo-z rows NaN), weight
+# (count | mass; mass = summed stellar mass of the k nearest tracers per volume
+# or area, columns <quantity>_<name>_k<k>_mass; the tracers are the tracers
+# that have a stellar mass), and for sigma2d: dv (km/s, spec-z slice half-width,
 # default 1500) and n_sigma (photo-z slice half-width in units of sigma (1+z),
-# default 1.5). Run `knn validate-photoz` to see how well each estimator and photo-z
-# mode recovers the spec-z environment of galaxies that also have a photo-z.
+# default 1.5). Run `knn validate-photoz` to see how well each estimator and
+# photo-z mode recovers the spec-z environment of galaxies that also have a
+# photo-z (REPORT_photoz_validation.md: knn3d is at chance level for photo-z
+# rows, hence photoz_mode: none on knn3d).
 environment:
   - name: knn3d
     k: 10
+    photoz_mode: none
   - name: sigma2d
     k: 10
+  - name: sigma2d
+    k: 10
+    weight: mass
+
+# Magnitudes for the mass-to-light relation and the colours. Sets (see
+# knn.photometry): legacy (mag_g, mag_r, mag_i, mag_z, mag_w1..4; Legacy
+# Surveys, AB), splus_auto, splus_pstotal, splus_aper_6 (S-PLUS <band>_<type>,
+# u g r i z). set: g, r, i for the mass and the g-r, g-i colours; ur_set: u and
+# r for u-r (needs S-PLUS u); wise_set: W1-W3. 99, NaN and inf are missing.
+# The magnitudes are assumed NOT to be corrected for Galactic extinction.
+photometry:
+  set: legacy
+  ur_set: splus_auto
+  wise_set: legacy
+  wise_system: ab      # mag_w1.. are AB (Legacy Surveys; checked: median W1-W2 Vega = +0.06)
+
+# E(B-V) source: null (not applied) | sfd (Schlegel+98 map via sfdmap, files in
+# sfd_dir) | name of a catalogue column. Coefficients A/E(B-V) are built in
+# (Schlafly & Finkbeiner 2011 Table 6 for S-PLUS, Legacy Surveys DR9 catalogue
+# documentation for Legacy g r i z W1-W3); extinction.coefficients overrides.
+extinction:
+  ebv: sfd
+  sfd_dir: /home/herpich/Documents/sfddata-master   # SFD_dust_4096_{ngp,sgp}.fits, outside the repository
+
+# K-corrections from Chilingarian et al. 2010, 2012 (SDSS filters; approximate
+# for DECam / S-PLUS; none for WISE)
+kcorrection:
+  apply: true
+
+# method: taylor (Taylor+11 g-i, log M*/Li) | w1 (Cluver+14 W1 with W1-W2);
+# fallback fills the NaNs of method from the other method (null = no fallback).
+mass:
+  method: taylor
+  fallback: null
+
+# Red sequence in g-r vs logmstar, fitted on spec-z galaxies (see
+# knn.indicators.fit_red_sequence); quenched = offset > -n_sigma_quench sigma.
+# W2-W3 >= w2w3_sf_threshold (Vega) flags star-forming systems (Cluver+14).
+indicators:
+  red_sequence:
+    n_sigma_quench: 2.0
+  w2w3_sf_threshold: 1.5
+
+# Positional cross-matches (nearest table row within radius_arcsec; ambiguous
+# matches are flagged in join_<name>_ambiguous). The two group files number
+# their groups differently (REPORT_masses.md), so their ids are kept in
+# separate columns and not merged.
+joins:
+  - name: morph
+    path: data/MKW4_properties_concat_all_final.csv
+    prefix: morph
+    ra: ra
+    dec: dec
+    columns: [Ser_n, C, A, S, Gini, M20, flag_morph, flag_sersic]
+  - name: grp_spec
+    path: data/MKW4_Nr200_10_07282025.csv
+    prefix: grp_spec
+    ra: RA
+    dec: Dec
+    columns: [id_group, id_group_final]
+    int_columns: [id_group, id_group_final]
+  - name: grp_photz
+    path: data/MKW4_photz_Nr200_10_07292025.csv
+    prefix: grp_photz
+    ra: RA
+    dec: Dec
+    columns: [id_group, id_group_final]
+    int_columns: [id_group, id_group_final]
+  - name: substructure
+    path: data/mkw4_substructures.csv
+    ra: RA
+    dec: Dec
+    unescape_latex: true
+    columns: {substructure: substructure}
+
+# Cluster phase space. ra, dec, z, r200_mpc, sigma_v are all optional (null).
+# ra and dec together with z give the projected radius; z gives the
+# line-of-sight velocity offset c (z - z_cl)/(1 + z_cl) of spec-z rows; without
+# them the catalogue's radius_Mpc and v_offset are passed through. r200_mpc and
+# sigma_v add R/R200 and |dv|/sigma. Only values taken from a paper are set:
+#   z: 0.02 and r200_mpc: 0.884 (X-ray R200 = 884 +- 17 kpc, 33.2 arcmin),
+#   Sarkar et al. 2021, MNRAS 501, 3767 (arXiv:2012.05160), Fig. 1 caption and Table 3 (Properties of MKW4); z ~ 0.02 as
+#   quoted in Secs. 1-2 (H0 = 70, Om = 0.3).
+# ra, dec and sigma_v were not found in a source we could fetch: left null.
+# (The catalogue's own radius_Mpc / v_offset imply a centre
+# (180.990, +1.886) deg and z_cl = 0.0200, see REPORT_masses.md.)
+cluster:
+  ra: null
+  dec: null
+  z: 0.02
+  r200_mpc: 0.884
+  sigma_v: null
 
 output: data/derived/MKW4_enriched.parquet

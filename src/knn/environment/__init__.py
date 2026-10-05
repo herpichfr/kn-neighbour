@@ -12,9 +12,14 @@ used by estimators with a photo-z dependent slice and ignored by the
 others. params are estimator specific options from the config (for
 example dv and n_sigma for 'sigma2d'); an unknown option raises TypeError.
 
+Every estimator takes weight='count' (default) or 'mass'. With 'mass' the
+tracers must carry a finite stellar mass in Points.mass (linear, Msun): the
+density is the summed mass of the k nearest tracers per volume (knn3d) or per
+area (sigma2d) instead of k per volume or area.
+
 The dict maps a quantity name ('r', 'rho', 'log1p_delta', ...) to an array
 with one value per target. The build step names the columns
-'<quantity>_<name>_k<k>'.
+'<quantity>_<name>_k<k>', with '_mass' appended for weight='mass'.
 """
 
 from dataclasses import dataclass
@@ -33,6 +38,8 @@ class Points:
     ra, dec : degrees
     z : redshift used for the position (spec-z, photo-z or a photo-z draw)
     is_phot : (N,) bool, True where z is a photo-z value; default all False
+    mass : (N,) stellar mass in Msun (linear), or None. Only the tracers of a
+        mass-weighted estimator need it, and it must be finite there.
     """
 
     xyz: np.ndarray
@@ -40,6 +47,7 @@ class Points:
     dec: np.ndarray
     z: np.ndarray
     is_phot: Optional[np.ndarray] = None
+    mass: Optional[np.ndarray] = None
 
     def __post_init__(self):
         self.xyz = np.asarray(self.xyz, dtype=float).reshape(-1, 3)
@@ -50,12 +58,36 @@ class Points:
         if self.is_phot is None:
             self.is_phot = np.zeros(n, dtype=bool)
         self.is_phot = np.asarray(self.is_phot, dtype=bool)
-        for name in ("ra", "dec", "z", "is_phot"):
+        names = ["ra", "dec", "z", "is_phot"]
+        if self.mass is not None:
+            self.mass = np.asarray(self.mass, dtype=float)
+            names.append("mass")
+        for name in names:
             if getattr(self, name).shape != (n,):
                 raise ValueError(f"'{name}' must have one entry per point")
 
     def __len__(self):
         return len(self.xyz)
+
+
+WEIGHTS = ("count", "mass")
+
+
+def tracer_masses(tracers, weight):
+    """Linear stellar masses of the tracers for a weight, or None for 'count'.
+
+    Raises ValueError for an unknown weight or for weight='mass' when a
+    tracer has no finite mass.
+    """
+    if weight not in WEIGHTS:
+        raise ValueError(f"unknown weight {weight!r}; choose from {WEIGHTS}")
+    if weight == "count":
+        return None
+    mass = tracers.mass
+    if mass is None or not np.isfinite(mass).all():
+        raise ValueError("weight='mass' needs a finite stellar mass for every tracer "
+                         "(exclude tracers without a mass from the tracer set)")
+    return mass
 
 
 def register(name):

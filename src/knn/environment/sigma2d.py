@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from . import register
+from . import register, tracer_masses
 
 C_KMS = 299792.458
 
@@ -30,22 +30,27 @@ def _unit_vectors(ra, dec):
     return np.column_stack([np.cos(dec) * np.cos(ra), np.cos(dec) * np.sin(ra), np.sin(dec)])
 
 
-def kth_angular_separation(tracers, targets, half_width, k, self_index=None):
-    """Angular separation (radians) to the k-th nearest tracer in a slice.
+def kth_angular_neighbours(tracers, targets, half_width, k, self_index=None, tracer_mass=None):
+    """Angular separation (radians) to the k-th nearest tracer in a slice, and
+    the summed mass of the k nearest tracers.
 
     The slice of target i holds the tracers with |z_tracer - z_i| <=
     half_width[i]. self_index[i] is the index in tracers of target i, or -1;
     that tracer is excluded by index. Targets with fewer than k tracers in
-    the slice get NaN.
+    the slice get NaN. tracer_mass, (N,) masses of the tracers, or None, in
+    which case the mass sum is NaN.
 
     Tracers are sorted by redshift once and each slice is found with
     searchsorted; the angular distances of one target are computed at once
     for the whole slice.
+
+    Returns (theta_k, mass_k), each (M,).
     """
     n_target = len(targets)
     order = np.argsort(tracers.z, kind="stable")
     z_sorted = tracers.z[order]
     unit = _unit_vectors(tracers.ra[order], tracers.dec[order])
+    mass_sorted = None if tracer_mass is None else np.asarray(tracer_mass, dtype=float)[order]
     position = np.empty(len(order), dtype=np.intp)
     position[order] = np.arange(len(order))
 
@@ -62,6 +67,7 @@ def kth_angular_separation(tracers, targets, half_width, k, self_index=None):
         self_pos[has_self] = position[self_index[has_self]]
 
     cos_k = np.full(n_target, np.nan)
+    mass_k = np.full(n_target, np.nan)
     for i in range(n_target):
         a, b = lo[i], hi[i]
         n = b - a
@@ -72,13 +78,26 @@ def kth_angular_separation(tracers, targets, half_width, k, self_index=None):
             if n - 1 < k:
                 continue
             cos[self_pos[i] - a] = -2.0
-        cos_k[i] = np.partition(cos, n - k)[n - k]
-    return np.arccos(np.clip(cos_k, -1.0, 1.0))
+        if mass_sorted is None:
+            cos_k[i] = np.partition(cos, n - k)[n - k]
+        else:
+            nearest = np.argpartition(cos, n - k)[n - k:]
+            cos_k[i] = cos[nearest].min()
+            mass_k[i] = mass_sorted[a:b][nearest].sum()
+    return np.arccos(np.clip(cos_k, -1.0, 1.0)), mass_k
+
+
+def kth_angular_separation(tracers, targets, half_width, k, self_index=None):
+    """Angular separation (radians) to the k-th nearest tracer in a slice.
+
+    See kth_angular_neighbours; returns only the separations.
+    """
+    return kth_angular_neighbours(tracers, targets, half_width, k, self_index)[0]
 
 
 @register("sigma2d")
 def sigma2d_columns(tracers, targets, k, self_index=None, *, sigma=None,
-                    dv=1500.0, n_sigma=1.5):
+                    dv=1500.0, n_sigma=1.5, weight="count"):
     """Projected k-th neighbour surface density.
 
     For each target, the tracers inside a redshift slice around the target's
@@ -97,16 +116,24 @@ def sigma2d_columns(tracers, targets, k, self_index=None, *, sigma=None,
     shift log1p_delta. Targets with fewer than k tracers in the slice get
     NaN.
 
+    weight='mass' (tracers need Points.mass, linear Msun): sigma is the
+    summed mass of the k nearest tracers in the slice per projected area,
+    M_k / (pi R_k^2) in Msun Mpc^-2, and the median is that of the same
+    quantity over the tracers.
+
     NOTE: the median normalisation is provisional, as in knn3d.
     """
     if k < 1:
         raise ValueError("k must be >= 1")
+    mass = tracer_masses(tracers, weight)
     d_target = np.linalg.norm(targets.xyz, axis=1)
     half = slice_half_width(targets.z, targets.is_phot, dv, n_sigma, sigma)
-    theta = kth_angular_separation(tracers, targets, half, k, self_index=self_index)
+    theta, mass_k = kth_angular_neighbours(tracers, targets, half, k, self_index,
+                                           tracer_mass=mass)
     r_k = d_target * theta
+    numerator = float(k) if mass is None else mass_k
     with np.errstate(divide="ignore", invalid="ignore"):
-        sigma_k = k / (np.pi * r_k ** 2)
+        sigma_k = numerator / (np.pi * r_k ** 2)
 
     n_tracer = len(tracers)
     d_tracer = np.linalg.norm(tracers.xyz, axis=1)
@@ -114,9 +141,11 @@ def sigma2d_columns(tracers, targets, k, self_index=None, *, sigma=None,
 
     def tracer_median(is_phot):
         half_t = slice_half_width(tracers.z, np.full(n_tracer, is_phot), dv, n_sigma, sigma)
-        th = kth_angular_separation(tracers, tracers, half_t, k, self_index=all_tracers)
+        th, m_t = kth_angular_neighbours(tracers, tracers, half_t, k, all_tracers,
+                                         tracer_mass=mass)
+        num = float(k) if mass is None else m_t
         with np.errstate(divide="ignore", invalid="ignore"):
-            values = k / (np.pi * (d_tracer * th) ** 2)
+            values = num / (np.pi * (d_tracer * th) ** 2)
         return np.nanmedian(values) if np.isfinite(values).any() else np.nan
 
     norm_spec = tracer_median(False) if (~targets.is_phot).any() else np.nan
