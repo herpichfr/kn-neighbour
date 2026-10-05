@@ -57,19 +57,21 @@ def knn3d(tracer_xyz, target_xyz, k, self_index=None):
 
 
 @register("knn3d")
-def knn3d_columns(tracer_xyz, target_xyz, k, self_index=None):
+def knn3d_columns(tracers, targets, k, self_index=None, *, sigma=None):
     """knn3d as a registered estimator.
 
-    Returns {'r': r_k, 'rho': rho_k, 'log1p_delta': ...} with
+    tracers, targets are Points; sigma is accepted for the common estimator
+    interface and not used. Returns {'r': r_k, 'rho': rho_k,
+    'log1p_delta': ...} with
     log1p_delta = log10(rho_k / median(rho_k over the tracers)).
 
     NOTE: the median normalisation is provisional. The median density of the
     tracers is a stand-in for the mean density of the survey volume, which
     needs a selection function / completeness model (later phase).
     """
-    r_k, rho_k = knn3d(tracer_xyz, target_xyz, k, self_index=self_index)
-    n_tracer = len(tracer_xyz)
-    _, rho_tracers = knn3d(tracer_xyz, tracer_xyz, k, self_index=np.arange(n_tracer))
+    r_k, rho_k = knn3d(tracers.xyz, targets.xyz, k, self_index=self_index)
+    n_tracer = len(tracers)
+    _, rho_tracers = knn3d(tracers.xyz, tracers.xyz, k, self_index=np.arange(n_tracer))
     with np.errstate(divide="ignore"):
         log1p_delta = np.log10(rho_k / np.median(rho_tracers))
     return {"r": r_k, "rho": rho_k, "log1p_delta": log1p_delta}

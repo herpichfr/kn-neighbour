@@ -19,11 +19,36 @@ cosmology:
 # open interval: z_lo < z_best < z_hi
 redshift_window: [0.007, 0.037]
 
+# Galaxies that trace the density field are taken from this window. Optional,
+# default = redshift_window. Must contain redshift_window. A wider window keeps
+# targets near the edges of redshift_window from seeing a truncated tracer volume.
+# Targets (the rows of the output) stay in redshift_window.
+tracer_window: [0.002, 0.042]
+
 # 'spec' = spec-z galaxies trace the density field, 'all' = every galaxy in the window
 tracers: spec
 
+# Environment of photo-z-only galaxies, measured against the tracers at
+# n_draws redshift draws per galaxy. The output columns hold the median over
+# the draws inside redshift_window (<col>_lo, <col>_hi: 16th and 84th
+# percentiles; p_in_window: fraction of draws inside the window).
+photoz:
+  mode: gauss       # point: z_phot | gauss: N(z_phot - bias (1+z), sigma (1+z)) | pdf: catalogue mixture
+  n_draws: 200
+  seed: 42
+  pdf_max_std: 0.5  # pdf mode: drop mixture components with std above this
+  sigma: null       # null = measure on galaxies with spec-z in the window and a photo-z
+  bias: null        # idem; sigma and bias are in units of (z_phot - z_spec)/(1 + z_spec)
+
+# Optional per-entry keys: photoz_mode (point | gauss | pdf, overrides photoz.mode
+# for that estimator), and for sigma2d: dv (km/s, spec-z slice half-width,
+# default 1500) and n_sigma (photo-z slice half-width in units of sigma (1+z),
+# default 1.5). Run `knn validate-photoz` to see how well each estimator and photo-z
+# mode recovers the spec-z environment of galaxies that also have a photo-z.
 environment:
   - name: knn3d
+    k: 10
+  - name: sigma2d
     k: 10
 
 output: data/derived/MKW4_enriched.parquet
