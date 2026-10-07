@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from . import __version__
+from .concentration import compute_concentration, conc_settings, default_sample
 from .config import photoz_settings, resolve_path, tracer_window
 from .environment import Points, get_estimator
 from .geometry import comoving_distance, comoving_xyz, make_cosmology
@@ -228,6 +229,12 @@ def _run(cfg):
         ps_cols, ps_info = phase_space(out, cluster_settings(cfg), cosmo)
         _add_columns(out, ps_cols)
         extra_info["phase_space"] = ps_info
+    if cfg.get("concentration") is not None:
+        conc_cfg = conc_settings(cfg)
+        conc_cols, conc_result = compute_concentration(
+            out, default_sample(out, conc_cfg), conc_cfg, cosmo, cluster_settings(cfg)["z"])
+        _add_columns(out, conc_cols)
+        extra_info["concentration"] = conc_result["info"]
 
     build_info = {
         "n_tracers": int(is_tracer.sum()),
@@ -296,7 +303,10 @@ def build(cfg, output=None):
     tracers are the tracers that have a mass, columns '<q>_<name>_k<k>_mass'),
     colours and indicators (knn.indicators), 'joins' (knn.joins) and
     'cluster' phase space (knn.phasespace). An environment entry with
-    photoz_mode 'none' leaves its photo-z rows NaN.
+    photoz_mode 'none' leaves its photo-z rows NaN. A 'concentration' section adds
+    the conc_ columns (map value and n sigma at each galaxy, inside the 1 sigma
+    contour, region, distance to the nearest ridge; knn.concentration) for the
+    configured sample and a summary to build_info['concentration'].
     """
     out, tracer_table, build_info = _run(cfg)
     out_path = Path(output) if output is not None else resolve_path(cfg, cfg["output"])

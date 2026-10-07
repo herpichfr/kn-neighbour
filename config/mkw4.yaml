@@ -150,4 +150,50 @@ cluster:
   r200_mpc: 0.884
   sigma_v: null
 
+# Projected concentration map of a redshift slice: density contours, peaks and ridges
+# (knn.concentration; the conc_ columns and the "Mass concentration" panel of the web app).
+# Read the map as a mountain range: contours at mean + n sigma of the map, the peaks, and
+# ridges that join the peaks along the higher ground between them (a network: every peak is
+# connected, a ridge can branch and can run off the map, see below). Needs cluster.z for the
+# Mpc per degree (every galaxy is placed at that distance, so use a narrow redshift
+# slice) and photometry for weight: mass. A galaxy is inside when the map at its position
+# is at or above the 1 sigma level (mean + sigma over the survey area).
+# The survey area is the convex hull of ALL the galaxies of the catalogue (any redshift):
+# an empty cell inside it has density 0, a cell outside is not drawn. A contour or a ridge
+# that reaches the border of the area stays open there.
+# Ridges: the crest (maximin path of the map) between peaks. The network is the union of the
+# crests between all the significant peaks and the highest cell of every stretch of the border
+# that is at or above the 1 sigma level (unless a peak is within 2 cells of it), cut into
+# segments at the peaks, at the branch points and at the border ends. There is no level
+# threshold, so every peak is joined to another one (its saddle, in sigma, tells how strong
+# the connection is) and a ridge may end open at the border. The web app can fit a model
+# (peaks and paths snapped to the crest, Gaussian profiles, 1 sigma bands) on top of it.
+#   sample: all (spec-z + photo-z) | spec. Galaxies of the map; photo-z exist for
+#     Dec < 3.4 only, so 'all' has a step in the map there. The app starts on this sample.
+#   z_range: [lo, hi] slice of z_best of the map (null = redshift_window). [0.017, 0.024]
+#     is the 5th-95th percentile of the spec-z within 1 Mpc of the cluster (0.0173-0.0236),
+#     rounded out. The app starts on this slice.
+#   weight: count | mass | a numeric column. mass = 10**logmstar x p_in_window.
+#   weight_clip: weights are capped at this percentile of the positive weights of the
+#     sample (null = no cap). The raw mass map is spiky: removing the 10 most massive
+#     galaxies changes it by up to 1.6 times the median level, with 95 by up to 0.6.
+#   bandwidth_mpc: Gaussian kernel of the map in proper Mpc; null = Scott's rule on the
+#     positions of the sample (the same as scipy gaussian_kde, 1.8 Mpc for MKW4).
+#   pixel_mpc: cell of the map; null = bandwidth / 4.
+#   contour_step_sigma: contours at mean + n sigma, n = 1, 1 + step, 1 + 2 step, ... up to
+#     the maximum of the map; more than 12 levels are thinned evenly (1 sigma and the
+#     highest are kept).
+#   min_prominence_sigma: a peak is marked if it is at or above the 1 sigma level and rises
+#     at least this many sigma above the highest saddle that connects it to a higher peak
+#     (1 = it has a contour of its own); the highest peak is always marked.
+concentration:
+  sample: all
+  z_range: [0.017, 0.024]
+  weight: mass
+  weight_clip: 95
+  bandwidth_mpc: null
+  pixel_mpc: null
+  contour_step_sigma: 1.0
+  min_prominence_sigma: 1.0
+
 output: data/derived/MKW4_enriched.parquet

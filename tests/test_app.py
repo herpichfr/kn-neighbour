@@ -79,7 +79,8 @@ def test_update_component_endpoint_changes_k(app, explorer):
     inputs = [("store-sample", "data", sample), ("store-env", "data", body["store-env"]["data"]),
               ("clear-selection", "n_clicks", 0), ("view-color", "value", "env"),
               ("view-clip", "value", [2, 98]), ("view-size", "value", None),
-              ("sky-density", "value", ["on"])]
+              ("sky-density", "value", ["on"]), ("store-struct", "data", None),
+              ("sky-pick", "value", [])]
     resp = _call(app, ["sky-fig.figure"], inputs, ["store-env.data"])
     assert resp.status_code == 200, resp.data
     figure = resp.get_json()["response"]["sky-fig"]["figure"]

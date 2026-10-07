@@ -5,3 +5,4 @@
 *.csv
 *.fits
 data/derived/
+HANDOFF.md

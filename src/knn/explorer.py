@@ -7,6 +7,9 @@ photo-z redshift draws. Its methods are what the web app (knn.app) calls:
     environment(name, k, ...)  estimator columns for all rows (cached)
     select(filters)            boolean mask of a sample selection
     trend(x, y, mask, ...)     running median / fraction in bins of x, per mass bin and z_type
+    concentration(mask, ...)   concentration map, contours, peaks and ridge network (cached)
+    model(mask, spec, ...)     ridge model of selected peaks and paths on that map (cached)
+    mass_table(columns, ...)   statistics inside / outside the 1 sigma contour
     numeric_columns(), boolean_columns()
     snapshot(state), load_snapshot(text)
 
@@ -22,6 +25,7 @@ reproduce the columns of the build exactly.
 
 import collections
 import datetime
+import hashlib
 import inspect
 import json
 import threading
@@ -34,9 +38,12 @@ from scipy.stats import norm
 
 from . import __version__
 from .build import ESTIMATOR_PARAMS, _git_head, build_in_memory, tracers_path
+from .concentration import (compute_concentration, compute_model, conc_settings, default_sample,
+                            default_spec)
 from .config import app_settings, photoz_settings, resolve_path
 from .environment import ESTIMATORS, Points, get_estimator
 from .geometry import make_cosmology
+from .phasespace import cluster_settings
 from .photoz_env import make_draws, photoz_environment
 from .redshift import PHOTOZ_MODES, resolve_photoz_params
 
@@ -46,9 +53,12 @@ NONE_LABEL = "(none)"
 MORPH_COLUMN = "morph_Ser_n"
 GROUP_COLUMN = "grp_photz_id_group_final"
 FILTER_KEYS = ("z_range", "z_types", "p_in_window_min", "odds_min", "logm_range", "mr_max",
-               "flag_member", "substructure", "group", "quenched", "morphology")
+               "flag_member", "substructure", "group", "quenched", "morphology", "conc_region",
+               "conc_model", "conc_params")
 ENV_CACHE_SIZE = 16
 MASK_CACHE_SIZE = 8
+CONC_CACHE_SIZE = 8
+MODEL_CACHE_SIZE = 8
 
 _BOOKKEEPING_PREFIXES = ("join_", "pdf_", "e_", "ID", "z_significant")
 _BOOKKEEPING_SUFFIXES = ("_lo", "_hi")
@@ -56,7 +66,8 @@ _BOOKKEEPING_NAMES = {"in_window", "in_overlap_region", "cx", "cy", "cz", "f_z",
                       "z_spec_err", "e_z", "THETA", "flag_morph", "morph_flag_morph",
                       "morph_flag_sersic", "flag_member"}
 _PREFERRED = ("env", "logmstar", "M_r", "M_i", "col_gr", "col_gi", "col_ur", "col_w2w3_vega",
-              "rs_offset", "morph_", "ps_", "z_best", "p_in_window", "z_phot_odds", "ra", "dec")
+              "rs_offset", "morph_", "ps_", "conc_", "z_best", "p_in_window", "z_phot_odds", "ra",
+              "dec")
 
 
 def wilson_interval(k, n, conf=0.68):
@@ -179,6 +190,95 @@ def trend_table(x, y, mask=None, mass=None, z_type=None, mass_bins=None, nbins=8
     return pd.DataFrame(rows, columns=list(TREND_COLUMNS))
 
 
+MASS_TABLE_COLUMNS = ("region", "z_type", "stat", "label", "value", "lo", "hi", "n")
+MASS_TABLE_REGIONS = ("inside", "outside")
+MASS_TABLE_ZTYPES = ("spec", "phot", "all")
+# (stat, label, kind, column): kind 'median' = median and 16-84 percentiles, 'fraction' =
+# fraction of a 0/1 column with its Wilson interval, 'total' = summed mass
+MASS_TABLE_STATS = (
+    ("n", "N galaxies", "count", None),
+    ("logm", "log M* [M_sun], median [16-84%]", "median", "logmstar"),
+    ("mtot", "total M* [log M_sun] (p_in_window weighted)", "total", "logmstar"),
+    ("conc", "log map value [weight/Mpc^2] at the galaxy, median [16-84%]", "median",
+     "conc_log_density"),
+    ("dist", "distance to the nearest ridge [Mpc], median [16-84%]", "median",
+     "conc_ridge_dist_mpc"),
+    ("quenched", "quenched fraction [Wilson 68%]", "fraction", "quenched"),
+    ("env", "environment log(1+delta), median [16-84%]", "median", "env"),
+    ("col_gr", "g-r, median [16-84%]", "median", "col_gr"),
+    ("r_r200", "R/R200 from the catalogue centre, median [16-84%]", "median",
+     "ps_R_over_r200"),
+    ("ser_n", "Sersic n, median [16-84%]", "median", MORPH_COLUMN),
+    ("morph_c", "concentration C, median [16-84%]", "median", "morph_C"),
+    ("in_group", "fraction in a group (id >= 0) [Wilson 68%]", "fraction", GROUP_COLUMN),
+)
+
+
+def mass_stats_table(frame, inside, z_type, mask=None, env=None, conf=0.68):
+    """Tidy table of statistics inside and outside the 1 sigma contour of the map.
+
+    frame: DataFrame with one row per galaxy; inside: boolean array (conc_inside);
+    z_type: array of 'spec' / 'phot'; mask: boolean array of the galaxies used
+    (default all); env: float array, the current estimator's log(1+delta)
+    (default: no environment row). Groups: region (inside, outside) x z_type
+    (spec, phot, all). A statistic whose column is missing from frame is left
+    out. Rows (MASS_TABLE_STATS): N; for 'median' the median and the 16th /
+    84th percentiles of the finite values; for 'total' the log10 of the summed
+    mass 10**logmstar x p_in_window (p_in_window 1 where missing) of the
+    galaxies with a mass; for 'fraction' the share of True / 1 (group: id >= 0)
+    and its Wilson interval of central probability conf. A group without
+    values has value, lo, hi NaN and n = 0.
+
+    Returns a DataFrame with MASS_TABLE_COLUMNS; n is the number of galaxies
+    with a value (the number of galaxies for the N row).
+    """
+    n_all = len(frame)
+    use = np.ones(n_all, dtype=bool) if mask is None else np.asarray(mask, dtype=bool)
+    inside = np.asarray(inside, dtype=bool)
+    z_type = np.asarray(z_type, dtype=object)
+    p_win = (frame["p_in_window"].to_numpy(float) if "p_in_window" in frame.columns
+             else np.ones(n_all))
+    p_win = np.where(np.isfinite(p_win), p_win, 1.0)
+
+    def column(name):
+        if name == "env":
+            return None if env is None else np.asarray(env, dtype=float)
+        if name == GROUP_COLUMN:
+            if name not in frame.columns:
+                return None
+            ids = _as_float(frame[name])
+            return np.where(np.isfinite(ids), (ids >= 0).astype(float), np.nan)
+        return _as_float(frame[name]) if name in frame.columns else None
+
+    rows = []
+    for stat, label, kind, name in MASS_TABLE_STATS:
+        values = None if name is None else column(name)
+        if name is not None and values is None:
+            continue
+        for region in MASS_TABLE_REGIONS:
+            in_region = use & (inside if region == "inside" else ~inside)
+            for ztype in MASS_TABLE_ZTYPES:
+                sel = in_region if ztype == "all" else in_region & (z_type == ztype)
+                value = lo = hi = np.nan
+                if kind == "count":
+                    n, value = int(sel.sum()), float(sel.sum())
+                else:
+                    v = values[sel]
+                    good = np.isfinite(v)
+                    n = int(good.sum())
+                    if n and kind == "median":
+                        lo, value, hi = (float(x) for x in np.percentile(v[good], [16, 50, 84]))
+                    elif n and kind == "fraction":
+                        k = float(v[good].sum())
+                        value = k / n
+                        lo, hi = (float(x) for x in wilson_interval(k, n, conf))
+                    elif n and kind == "total":
+                        value = float(np.log10(np.sum(p_win[sel][good] * 10.0 ** v[good])))
+                rows.append({"region": region, "z_type": ztype, "stat": stat, "label": label,
+                             "value": value, "lo": lo, "hi": hi, "n": n})
+    return pd.DataFrame(rows, columns=list(MASS_TABLE_COLUMNS))
+
+
 def _plain(value):
     """YAML-safe copy of a snapshot state (numpy -> python, tuples -> lists)."""
     if isinstance(value, dict):
@@ -212,9 +312,13 @@ class Explorer:
         self.is_spec = self.z_type == "spec"
         self.is_phot = self.z_type == "phot"
         self.params = resolve_photoz_params(self.df, self.settings, self.window)
+        self.conc_settings = (conc_settings(cfg) if cfg.get("concentration") is not None
+                              else None)
         self._lock = threading.RLock()
         self._env_cache = collections.OrderedDict()
         self._mask_cache = collections.OrderedDict()
+        self._conc_cache = collections.OrderedDict()
+        self._model_cache = collections.OrderedDict()
         self._draws = {}
         self._tracer_sets = {}
         self._git = None
@@ -462,6 +566,14 @@ class Explorer:
         group [...]               grp_photz_id_group_final in the values; '(none)' = unmatched
         quenched 'any'|'yes'|'no'
         morphology True           has a morphology match (morph_Ser_n finite)
+        conc_region 'any'|'inside'|'outside'   inside / outside the 1 sigma contour of the
+                                  map of the galaxies passing every other filter
+        conc_model {...}          a model spec (knn.concentration.compute_model: peaks and
+                                  paths); with conc_region, inside / outside is the 1 sigma
+                                  band of that model (model_inside of Explorer.model)
+                                  instead of the 1 sigma contour; empty = the contour
+        conc_params {...}         keyword arguments of Explorer.concentration (weight,
+                                  bandwidth_mpc, ...) for conc_region and conc_model
 
         An empty list means no filter. A filter whose column is missing from
         the catalogue raises KeyError. Unknown keys raise ValueError.
@@ -528,6 +640,19 @@ class Explorer:
             mask &= (q == want).to_numpy(dtype=bool, na_value=False)
         if active("morphology") and f["morphology"]:
             mask &= np.isfinite(self._need(MORPH_COLUMN, "morphology").to_numpy(float))
+        if active("conc_region") and f["conc_region"] != "any":
+            if f["conc_region"] not in MASS_TABLE_REGIONS:
+                raise ValueError(f"conc_region must be any, inside or outside, got "
+                                 f"{f['conc_region']!r}")
+            spec = f.get("conc_model")
+            empty = spec is None or (isinstance(spec, dict)
+                                     and not (spec.get("peaks") or spec.get("paths")))
+            if not empty:
+                columns, _ = self.model(mask.copy(), spec, **(f.get("conc_params") or {}))
+                mask &= columns["model_inside"] == (f["conc_region"] == "inside")
+            else:
+                columns, _ = self.concentration(mask.copy(), **(f.get("conc_params") or {}))
+                mask &= columns["conc_inside"] == (f["conc_region"] == "inside")
         with self._lock:
             self._mask_cache[cache_key] = mask
             while len(self._mask_cache) > MASK_CACHE_SIZE:
@@ -549,6 +674,104 @@ class Explorer:
         """(n spec-z, n photo-z) among the rows of mask."""
         mask = np.asarray(mask, dtype=bool)
         return int((mask & self.is_spec).sum()), int((mask & self.is_phot).sum())
+
+    # concentration -------------------------------------------------------
+
+    def default_concentration(self):
+        """The concentration controls of the config for the app.
+
+        Keys: weight, bandwidth_mpc, contour_step_sigma, min_prominence_sigma. None for
+        bandwidth_mpc means Scott's rule. Needs a 'concentration' section in the config.
+        """
+        if self.conc_settings is None:
+            raise ValueError("the config has no 'concentration' section")
+        s = self.conc_settings
+        return {"weight": s["weight"], "bandwidth_mpc": s["bandwidth_mpc"],
+                "contour_step_sigma": s["contour_step_sigma"],
+                "min_prominence_sigma": s["min_prominence_sigma"]}
+
+    def _conc_key(self, mask, params):
+        """(settings, mask, cache key) of a concentration request."""
+        if self.conc_settings is None:
+            raise ValueError("the config has no 'concentration' section")
+        settings = conc_settings(self.cfg, **params)
+        if mask is None:
+            mask = default_sample(self.df, settings)
+        mask = np.asarray(mask, dtype=bool)
+        key = (hashlib.sha1(np.packbits(mask).tobytes()).hexdigest(),
+               json.dumps(settings, sort_keys=True, default=str))
+        return settings, mask, key
+
+    def concentration(self, mask=None, **params):
+        """(columns, result) of knn.concentration.compute_concentration for the galaxies of mask.
+
+        mask: boolean array, default the build sample (z_range and sample of the
+        config). params override the 'concentration' section of the config (weight,
+        weight_clip, bandwidth_mpc, pixel_mpc, contour_step_sigma, min_prominence_sigma;
+        None = the config value). The survey footprint is that of all the rows of the
+        catalogue, whatever the mask. Results are cached (LRU, CONC_CACHE_SIZE): the same
+        arguments return the identical objects, which callers must not modify. Raises
+        ValueError without a 'concentration' section and ConcentrationError for a sample
+        that is too small.
+        """
+        settings, mask, key = self._conc_key(mask, params)
+        with self._lock:
+            hit = self._conc_cache.get(key)
+            if hit is not None:
+                self._conc_cache.move_to_end(key)
+                return hit
+            hit = compute_concentration(self.df, mask, settings, self.cosmo,
+                                        cluster_settings(self.cfg)["z"])
+            self._conc_cache[key] = hit
+            while len(self._conc_cache) > CONC_CACHE_SIZE:
+                self._conc_cache.popitem(last=False)
+            return hit
+
+    def model(self, mask=None, spec=None, **params):
+        """(columns, model) of knn.concentration.compute_model on Explorer.concentration(mask, ...).
+
+        spec: {"peaks": [[ra, dec], ...], "paths": [{"label", "ra", "dec"}, ...]}; None =
+        default_spec of the map (every peak and ridge segment). params as for
+        concentration. Results are cached (LRU, MODEL_CACHE_SIZE) on the concentration key
+        and the spec: the same arguments return the identical objects, which callers must
+        not modify. Raises as concentration does, and ValueError (ConcentrationError) for a
+        spec that is empty, malformed or not JSON-serialisable.
+        """
+        _, mask, conc_key = self._conc_key(mask, params)
+        columns, result = self.concentration(mask, **params)
+        spec = default_spec(result) if spec is None else _plain(spec)
+        try:
+            key = (conc_key, json.dumps(spec, sort_keys=True))
+        except (TypeError, ValueError) as err:
+            raise ValueError(f"the model spec is not JSON-serialisable: {err}") from None
+        with self._lock:
+            hit = self._model_cache.get(key)
+            if hit is not None:
+                self._model_cache.move_to_end(key)
+                return hit
+            hit = compute_model(self.df, result, spec)
+            self._model_cache[key] = hit
+            while len(self._model_cache) > MODEL_CACHE_SIZE:
+                self._model_cache.popitem(last=False)
+            return hit
+
+    def mass_table(self, columns, mask=None, env=None, inside=None):
+        """mass_stats_table of the galaxies of mask, inside / outside as in columns.
+
+        columns: the first element of Explorer.concentration (conc_inside, conc_density,
+        conc_ridge_dist_mpc); env: array of the current environment (log(1+delta), one
+        entry per row) or None; inside: boolean array (one entry per row) that replaces
+        columns['conc_inside'], e.g. model_inside of Explorer.model.
+        """
+        needed = {name for _, _, _, name in MASS_TABLE_STATS if name} | {"p_in_window"}
+        frame = pd.DataFrame({c: self.df[c] for c in needed if c in self.df.columns})
+        dens = columns["conc_density"]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            frame["conc_log_density"] = np.where(dens > 0,
+                                                 np.log10(np.where(dens > 0, dens, 1.0)), np.nan)
+        frame["conc_ridge_dist_mpc"] = columns["conc_ridge_dist_mpc"]
+        return mass_stats_table(frame, columns["conc_inside"] if inside is None else inside,
+                                self.z_type, mask, env)
 
     # trends -------------------------------------------------------------
 

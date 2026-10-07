@@ -2,7 +2,8 @@
 
 STATE_CONTROLS lists every control as (state key, component id, property);
 default_state(explorer) gives the value of each state key at start, and the
-snapshot of the app is a dict with these keys.
+snapshot of the app is a dict with these keys. The selection in progress on the sky map
+(store-struct) is not part of the snapshot; the model that was run (store-model) is.
 """
 
 import math
@@ -10,7 +11,7 @@ import math
 import numpy as np
 from dash import dcc, html
 
-from ..explorer import NONE_LABEL
+from ..explorer import MASS_TABLE_REGIONS, MASS_TABLE_STATS, MASS_TABLE_ZTYPES, NONE_LABEL
 from .figures import empty_figure, graph_config
 
 STATE_CONTROLS = (
@@ -25,6 +26,11 @@ STATE_CONTROLS = (
     ("groups", "f-group", "value"),
     ("quenched", "f-quenched", "value"),
     ("morph", "f-morph", "value"),
+    ("concregion", "f-concregion", "value"),
+    ("concw", "conc-weight", "value"),
+    ("conch", "conc-bw", "value"),
+    ("concstep", "conc-step", "value"),
+    ("concprom", "conc-prom", "value"),
     ("estimator", "env-estimator", "value"),
     ("k", "env-k", "value"),
     ("weight", "env-weight", "value"),
@@ -41,13 +47,27 @@ STATE_CONTROLS = (
     ("mass_bins", "an-massbins", "value"),
     ("nbins", "an-nbins", "value"),
     ("imgfmt", "export-imgfmt", "value"),
+    ("model", "store-model", "data"),
 )
 STATE_KEYS = tuple(key for key, _, _ in STATE_CONTROLS)
 SAMPLE_KEYS = ("z_range", "z_types", "p_min", "odds_min", "logm_range", "mr_max", "member",
-               "subs", "groups", "quenched", "morph")
+               "subs", "groups", "quenched", "morph", "concregion", "concw", "conch", "concstep",
+               "concprom", "model")
 ENV_KEYS = ("estimator", "k", "weight", "dv", "n_sigma", "pzmode")
 KNN3D_NOTE = "not defined for photo-z galaxies (see REPORT_photoz_validation.md)"
 DEFAULT_MASS_BINS = "8, 9, 10, 11"
+PICK_HINT = ("Select peaks: click a star, a ridge or a drawn path to switch it on / off. Select "
+             "maximums: drag along a ridge to draw a path (clicks do not register while drawing: "
+             "uncheck it to click). Run model fits the structures that are on to the crest of the "
+             "map and gives the 1σ band around them.")
+STRUCTURE_HEADER = ("structure", "kind", "s [Mpc]", "intrinsic s [Mpc]", "crest [σ] (mean / min)",
+                    "length [Mpc]", "shift [Mpc]", "N in band")
+
+
+def default_struct():
+    """Value of store-struct at start: the structures of the sky map that are switched off, the
+    drawn paths ({id, ra, dec, on, src}) and the map (map_key) the off ids belong to."""
+    return {"map_key": None, "off_peaks": [], "off_ridges": [], "paths": [], "next_id": 1}
 
 
 def logm_bounds(explorer):
@@ -68,22 +88,36 @@ def default_state(explorer):
     boolean = explorer.boolean_columns()
     numeric = explorer.numeric_columns()
     y = "quenched" if "quenched" in boolean else (boolean[0] if boolean else numeric[0])
+    conc = explorer.conc_settings
+    z_range = list(conc["z_range"]) if conc and conc["z_range"] else list(explorer.window)
+    z_types = ["spec"] if conc and conc["sample"] == "spec" else ["spec", "phot"]
+    conc_ctl = explorer.default_concentration() if conc else {
+        "weight": "count", "bandwidth_mpc": None, "contour_step_sigma": 1.0,
+        "min_prominence_sigma": 1.0}
     return {
-        "z_range": list(explorer.window), "z_types": ["spec", "phot"], "p_min": 0.0,
+        "z_range": z_range, "z_types": z_types, "p_min": 0.0,
         "odds_min": 0.0, "logm_range": [lo, hi], "mr_max": None, "member": [], "subs": [],
-        "groups": [], "quenched": "any", "morph": [],
+        "groups": [], "quenched": "any", "morph": [], "concregion": "any",
+        "concw": conc_ctl["weight"], "conch": conc_ctl["bandwidth_mpc"],
+        "concstep": conc_ctl["contour_step_sigma"], "concprom": conc_ctl["min_prominence_sigma"],
         "estimator": env["name"], "k": env["k"], "weight": env["weight"],
         "dv": env["dv"] if env["dv"] is not None else 1500.0,
         "n_sigma": env["n_sigma"] if env["n_sigma"] is not None else 1.5,
         "pzmode": env["photoz_mode"] if env["photoz_mode"] != "none" else explorer.settings["mode"],
         "coords": "radecz", "color": "env", "size": None, "clip": [2, 98], "density": ["on"],
         "y": y, "x": "env", "mass_bins": DEFAULT_MASS_BINS if explorer.has_column("logmstar") else "",
-        "nbins": 8, "imgfmt": "png",
+        "nbins": 8, "imgfmt": "png", "model": None,
     }
 
 
 def _options(values):
     return [{"label": f"{v:g}" if isinstance(v, float) else str(v), "value": v} for v in values]
+
+
+def conc_weight_options(explorer):
+    """Weights of the concentration map: count, mass (if the masses exist), numeric columns."""
+    names = ["count"] + (["mass"] if explorer.has_column("logmstar") else [])
+    return names + [c for c in explorer.numeric_columns(include_env=False) if c not in names]
 
 
 def _field(label, control, hint=None):
@@ -103,6 +137,7 @@ def _sample_section(explorer, st):
     choices = explorer.choices()
     marks = {int(v): str(int(v)) for v in range(lo, hi + 1)}
     zmarks = {float(v): f"{v:g}" for v in (zlo, (zlo + zhi) / 2, zhi)}
+    has_conc = explorer.conc_settings is not None
     return _section("Sample", [
         _field("Redshift", dcc.RangeSlider(id="f-z", min=zlo, max=zhi, step=0.001,
                                            value=st["z_range"], marks=zmarks)),
@@ -138,8 +173,37 @@ def _sample_section(explorer, st):
         dcc.Checklist(id="f-morph", options=[{"label": " morphology available",
                                               "value": "yes"}],
                       value=st["morph"], className="check"),
+        _field("1σ region", dcc.RadioItems(
+            id="f-concregion",
+            options=[{"label": " all", "value": "any", "disabled": not has_conc},
+                     {"label": " inside", "value": "inside", "disabled": not has_conc},
+                     {"label": " outside", "value": "outside", "disabled": not has_conc}],
+            value=st["concregion"], inline=True, className="check"),
+            None if has_conc else "needs a concentration section in the config"),
         html.Div(id="sample-counts", className="counts"),
     ])
+
+
+def _concentration_section(explorer, st):
+    off = explorer.conc_settings is None
+    return _section("Concentration", [
+        _field("Weight of the map", dcc.Dropdown(
+            id="conc-weight", options=_options(conc_weight_options(explorer)), value=st["concw"],
+            clearable=False, disabled=off),
+               "count, stellar mass (capped), or a catalogue column"),
+        _field("Bandwidth [Mpc]", dcc.Input(
+            id="conc-bw", type="number", min=0.1, step=0.1, value=st["conch"], debounce=True,
+            placeholder="Scott", className="num", disabled=off),
+               "empty = Scott's rule on the sample positions"),
+        _field("Contour step [σ]", dcc.Input(
+            id="conc-step", type="number", min=0.1, step=0.1, value=st["concstep"],
+            debounce=True, className="num", disabled=off),
+               "levels at mean + 1σ, then every step"),
+        _field("Min prominence [σ]", dcc.Input(
+            id="conc-prom", type="number", min=0, step=0.1, value=st["concprom"],
+            debounce=True, className="num", disabled=off),
+               "peaks lower than this above their saddle are not marked"),
+    ], open_=not off)
 
 
 def _environment_section(explorer, st):
@@ -236,6 +300,111 @@ def _analysis_section(explorer, st):
     ], className="analysis")
 
 
+def _format_cell(row):
+    """Text of one cell of the statistics table from a row of Explorer.mass_table."""
+    if row["stat"] == "n":
+        return f"{int(row['n'])}"
+    if row["n"] == 0 or not np.isfinite(row["value"]):
+        return "-"
+    if row["stat"] == "mtot":
+        return f"{row['value']:.2f} (N={int(row['n'])})"
+    return f"{row['value']:.2f} [{row['lo']:.2f}, {row['hi']:.2f}] N={int(row['n'])}"
+
+
+def mass_table_rows(table):
+    """Rows of strings of the statistics table: a header and one row per statistic.
+
+    table is Explorer.mass_table. Columns: the statistic, then inside
+    (spec-z, photo-z, all) and outside (spec-z, photo-z, all).
+    """
+    names = {"spec": "spec-z", "phot": "photo-z", "all": "all"}
+    header = ["statistic"] + [f"{region} {names[z]}" for region in MASS_TABLE_REGIONS
+                              for z in MASS_TABLE_ZTYPES]
+    rows = [header]
+    present = set(table["stat"])
+    for stat, label, _, _ in MASS_TABLE_STATS:
+        if stat not in present:
+            continue
+        sub = table[table["stat"] == stat]
+        cells = [label]
+        for region in MASS_TABLE_REGIONS:
+            for ztype in MASS_TABLE_ZTYPES:
+                hit = sub[(sub["region"] == region) & (sub["z_type"] == ztype)]
+                cells.append(_format_cell(hit.iloc[0]) if len(hit) else "-")
+        rows.append(cells)
+    return rows
+
+
+def mass_table_component(table):
+    """html.Table of mass_table_rows."""
+    rows = mass_table_rows(table)
+    head = html.Thead(html.Tr([html.Th(c) for c in rows[0]]))
+    body = html.Tbody([html.Tr([html.Td(c) for c in r]) for r in rows[1:]])
+    return html.Table([head, body], className="conc-table")
+
+
+def structure_table_rows(model, counts):
+    """Rows of strings of the table of the structures of a model: a header and one row per
+    peak and path. model is the second element of Explorer.model; counts maps a structure
+    label to the number of galaxies of the selection inside its band."""
+    rows = [list(STRUCTURE_HEADER)]
+    for p in model["peaks"]:
+        rows.append([p["label"], "peak", f"{p['width_mpc']:.2f}", f"{p['width_intrinsic_mpc']:.2f}",
+                     f"{p['n_sigma']:.1f}", "-", f"{p['shift_mpc']:.2f}",
+                     str(counts.get(p["label"], 0))])
+    for p in model["paths"]:
+        rows.append([p["label"], "path", f"{p['width_median_mpc']:.2f}",
+                     f"{p['width_intrinsic_median_mpc']:.2f}",
+                     f"{p['crest_n_sigma_mean']:.1f} / {p['crest_n_sigma_min']:.1f}",
+                     f"{p['length_mpc']:.1f}", f"{p['shift_max_mpc']:.2f}",
+                     str(counts.get(p["label"], 0))])
+    return rows
+
+
+def structure_table_component(model, counts):
+    """html.Table of structure_table_rows."""
+    rows = structure_table_rows(model, counts)
+    head = html.Thead(html.Tr([html.Th(c) for c in rows[0]]))
+    body = html.Tbody([html.Tr([html.Td(c) for c in r]) for r in rows[1:]])
+    return html.Table([head, body], className="conc-table")
+
+
+def _mass_section(explorer):
+    """Panel with the summary of the map, the statistics table and the table of the structures
+    of the model (filled by a callback)."""
+    return html.Div([
+        html.H3("Mass concentration"),
+        html.Div(id="conc-summary", className="conc-summary"),
+        html.Div(id="conc-caption", className="counts"),
+        html.Div(html.Div(id="conc-table"), className="conc-table-wrap"),
+        html.Div(html.Div(id="model-table"), className="conc-table-wrap"),
+    ], className="analysis")
+
+
+def _pick_controls(explorer):
+    """Controls of the interactive sky map: pick modes, switch all, draw, run the model.
+
+    Always in the tree (the callbacks read them); hidden and disabled without a
+    'concentration' section.
+    """
+    off = explorer.conc_settings is None
+    buttons = [html.Button(label, id=cid, n_clicks=0, disabled=off) for cid, label in (
+        ("btn-pick-all", "All on"), ("btn-pick-none", "All off"),
+        ("btn-clear-paths", "Clear drawn paths"))]
+    run = [html.Button(label, id=cid, n_clicks=0, disabled=off) for cid, label in (
+        ("btn-run-model", "Run model"), ("btn-clear-model", "Clear model"))]
+    return html.Div([
+        html.Div([dcc.Checklist(
+            id="sky-pick", options=[{"label": " Select peaks", "value": "peaks"},
+                                    {"label": " Select maximums", "value": "paths"}],
+            value=[], inline=True, className="check", inputStyle={"marginRight": "3px"}),
+            *buttons, html.Span(id="pick-info", className="counts")], className="row tight"),
+        html.Div([*run, html.Span("model: not run", id="model-status", className="counts")],
+                 className="row tight"),
+        html.Div(PICK_HINT, className="hint"),
+    ], id="pick-controls", className="pick-controls", style={"display": "none"} if off else {})
+
+
 def build_layout(explorer):
     """Full page: header, sidebar (sample, environment, view, export), views, analysis."""
     st = default_state(explorer)
@@ -248,8 +417,9 @@ def build_layout(explorer):
                  className="subtitle"),
     ], className="header")
     sidebar = html.Div([
-        _sample_section(explorer, st), _environment_section(explorer, st),
-        _view_section(explorer, st), _export_section(explorer, st),
+        _sample_section(explorer, st), _concentration_section(explorer, st),
+        _environment_section(explorer, st), _view_section(explorer, st),
+        _export_section(explorer, st),
     ], className="sidebar")
     main = html.Div([
         html.Div([
@@ -258,11 +428,15 @@ def build_layout(explorer):
                 html.H3("Sky"),
                 html.Div([html.Button("Clear selection", id="clear-selection", n_clicks=0),
                           html.Span(id="sel-info", className="counts")], className="row tight"),
-                _graph("sky-fig", "480px", "knn_sky"),
+                _pick_controls(explorer),
+                _graph("sky-fig", "560px", "knn_sky"),
             ], className="col"),
         ], className="row"),
         _analysis_section(explorer, st),
-    ], className="main")
-    stores = [dcc.Store(id="store-sample"), dcc.Store(id="store-env"), dcc.Store(id="store-sel")]
+    ] + ([_mass_section(explorer)] if explorer.conc_settings is not None else []),
+        className="main")
+    stores = [dcc.Store(id="store-sample"), dcc.Store(id="store-env"), dcc.Store(id="store-sel"),
+              dcc.Store(id="store-struct", data=default_struct()),
+              dcc.Store(id="store-model", data=st["model"])]
     return html.Div([header, html.Div([sidebar, main], className="body")] + stores,
                     className="page")

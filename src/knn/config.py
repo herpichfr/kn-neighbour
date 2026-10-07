@@ -5,6 +5,7 @@ from pathlib import Path
 
 import yaml
 
+from .concentration import CONC_DEFAULTS, SAMPLES
 from .indicators import INDICATOR_DEFAULTS
 from .mass import MASS_DEFAULTS, METHODS
 from .phasespace import CLUSTER_KEYS
@@ -24,7 +25,7 @@ ENVIRONMENT_KEYS = ("name", "k", "dv", "n_sigma", "photoz_mode", "weight")
 ENTRY_PHOTOZ_MODES = PHOTOZ_MODES + ("none",)
 WEIGHTS = ("count", "mass")
 OPTIONAL_SECTIONS = ("photometry", "extinction", "kcorrection", "mass", "indicators",
-                     "joins", "cluster", "app")
+                     "joins", "cluster", "concentration", "app")
 # explorer (knn serve): minimum number of galaxies in a trend bin, else the bin is empty
 APP_DEFAULTS = {"min_per_bin": 10}
 JOIN_KEYS = ("name", "path", "columns", "prefix", "ra", "dec", "radius_arcsec",
@@ -209,6 +210,35 @@ def _validate_cluster(sec, cfg):
                           "from 'cluster.ra' and 'cluster.dec'")
 
 
+def _validate_concentration(sec, cfg):
+    _section(sec, "concentration", CONC_DEFAULTS)
+    if sec.get("sample", CONC_DEFAULTS["sample"]) not in SAMPLES:
+        raise ConfigError(f"'concentration.sample' must be one of {SAMPLES}")
+    if sec.get("z_range") is not None:
+        _check_pair(sec["z_range"], "concentration.z_range")
+    weight = sec.get("weight", CONC_DEFAULTS["weight"])
+    if not isinstance(weight, str) or not weight:
+        raise ConfigError("'concentration.weight' must be 'count', 'mass' or a column name")
+    clip = sec.get("weight_clip", CONC_DEFAULTS["weight_clip"])
+    if clip is not None and (not _is_number(clip) or not 0 < clip <= 100):
+        raise ConfigError("'concentration.weight_clip' must be null or a percentile in (0, 100]")
+    for key in ("bandwidth_mpc", "pixel_mpc"):
+        if sec.get(key) is not None and (not _is_number(sec[key]) or sec[key] <= 0):
+            raise ConfigError(f"'concentration.{key}' must be a number > 0 or null")
+    if "contour_step_sigma" in sec and (not _is_number(sec["contour_step_sigma"])
+                                        or sec["contour_step_sigma"] <= 0):
+        raise ConfigError("'concentration.contour_step_sigma' must be a number > 0")
+    if "min_prominence_sigma" in sec and (not _is_number(sec["min_prominence_sigma"])
+                                          or sec["min_prominence_sigma"] < 0):
+        raise ConfigError("'concentration.min_prominence_sigma' must be a number >= 0")
+    if weight == "mass" and not cfg.get("photometry"):
+        raise ConfigError("'concentration.weight' is 'mass': needs a 'photometry' section "
+                          "(the stellar masses)")
+    if (cfg.get("cluster") or {}).get("z") is None:
+        raise ConfigError("'concentration' needs 'cluster.z' (the distance that sets the Mpc "
+                          "scale)")
+
+
 def _validate_app(sec, cfg):
     _section(sec, "app", APP_DEFAULTS)
     if "min_per_bin" in sec and (not _is_int(sec["min_per_bin"]) or sec["min_per_bin"] < 1):
@@ -219,7 +249,8 @@ _SECTION_VALIDATORS = {
     "photometry": _validate_photometry, "extinction": _validate_extinction,
     "kcorrection": _validate_kcorrection, "mass": _validate_mass,
     "indicators": _validate_indicators, "joins": _validate_joins,
-    "cluster": _validate_cluster, "app": _validate_app,
+    "cluster": _validate_cluster, "concentration": _validate_concentration,
+    "app": _validate_app,
 }
 
 

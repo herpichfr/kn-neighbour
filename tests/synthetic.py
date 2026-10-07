@@ -85,14 +85,17 @@ BUILD_CONFIG = {
 }
 
 
-def write_build_catalogue(root):
-    """Write data/cat.parquet and data/aux.csv under root (a raw catalogue for knn.build)."""
+def write_build_catalogue(root, n_spec=N_SPEC, n_phot=N_PHOT):
+    """Write data/cat.parquet and data/aux.csv under root (a raw catalogue for knn.build).
+
+    n_spec spec-z galaxies followed by n_phot photo-z galaxies, uniform on 1 x 1 deg.
+    """
     rng = np.random.default_rng(11)
-    n = N_SPEC + N_PHOT
+    n = n_spec + n_phot
     zspec = np.full(n, np.nan)
     zphot = np.full(n, np.nan)
-    zspec[:N_SPEC] = rng.uniform(0.012, 0.03, N_SPEC)
-    zphot[N_SPEC:] = rng.uniform(0.012, 0.03, N_PHOT)
+    zspec[:n_spec] = rng.uniform(0.012, 0.03, n_spec)
+    zphot[n_spec:] = rng.uniform(0.012, 0.03, n_phot)
     z = np.where(np.isfinite(zspec), zspec, zphot)
     gi = rng.uniform(0.3, 1.3, n)
     i = rng.normal(-18.0, 1.0, n) + COSMO.distmod(z).value
@@ -125,3 +128,58 @@ def build_synthetic_config(root):
     path.parent.mkdir(exist_ok=True)
     path.write_text(yaml.safe_dump(BUILD_CONFIG))
     return load_config(path)
+
+
+CONC_TRUTH = {"ra": 181.0, "dec": 2.0, "z": 0.02}
+
+
+def conc_positions(blobs=(), bridges=(), n_field=2500, radius_mpc=15.0, seed=1):
+    """(x, y) in Mpc on the tangent plane at (CONC_TRUTH ra, dec) of a planted field.
+
+    n_field galaxies uniform in a disc of radius_mpc; blobs: (x, y, sigma, n) Gaussian clumps;
+    bridges: (x0, y0, x1, y1, bend, sigma, n) galaxies uniform along the arc bridge_curve with
+    a Gaussian offset sigma across it. Clump and bridge galaxies outside the disc are dropped,
+    so the survey stays a disc and a clump at its edge is cut by it.
+    """
+    rng = np.random.default_rng(seed)
+    r = radius_mpc * np.sqrt(rng.uniform(0.0, 1.0, n_field))
+    theta = rng.uniform(0.0, 2.0 * np.pi, n_field)
+    pts = [np.column_stack([r * np.cos(theta), r * np.sin(theta)])]
+    for cx, cy, sigma, n in blobs:
+        pts.append(np.column_stack([rng.normal(cx, sigma, n), rng.normal(cy, sigma, n)]))
+        pts[-1] = pts[-1][np.hypot(*pts[-1].T) <= radius_mpc]
+    for x0, y0, x1, y1, bend, sigma, n in bridges:
+        t = rng.uniform(0.0, 1.0, n)
+        curve = bridge_curve(x0, y0, x1, y1, bend, t)
+        length = np.hypot(x1 - x0, y1 - y0)
+        normal = np.array([-(y1 - y0), x1 - x0]) / length
+        pts.append(curve + rng.normal(0.0, sigma, n)[:, None] * normal)
+        pts[-1] = pts[-1][np.hypot(*pts[-1].T) <= radius_mpc]
+    return np.vstack(pts)
+
+
+def bridge_curve(x0, y0, x1, y1, bend, t):
+    """Points (len(t), 2) of the arc from (x0, y0) to (x1, y1) bulging by bend Mpc, t in [0, 1]."""
+    t = np.asarray(t, dtype=float)
+    length = np.hypot(x1 - x0, y1 - y0)
+    normal = np.array([-(y1 - y0), x1 - x0]) / length
+    line = np.column_stack([x0 + t * (x1 - x0), y0 + t * (y1 - y0)])
+    return line + (bend * np.sin(np.pi * t))[:, None] * normal
+
+
+def conc_frame(seed=1, **kwargs):
+    """Table with the columns of the enriched one for conc_positions(seed=seed, **kwargs).
+
+    Columns ra, dec, z_best (0.02 +- 0.002), z_type (all spec-z), logmstar (log M* ~ N(9, 0.4),
+    independent of position), p_in_window.
+    """
+    from knn.concentration import inverse_tangent_plane
+    t = CONC_TRUTH
+    d_a = float(COSMO.angular_diameter_distance(t["z"]).value)
+    x, y = conc_positions(seed=seed, **kwargs).T
+    ra, dec = inverse_tangent_plane(x / d_a, y / d_a, t["ra"], t["dec"])
+    rng = np.random.default_rng(seed + 100)
+    n = len(ra)
+    return pd.DataFrame({"ra": ra, "dec": dec, "z_best": t["z"] + rng.normal(0.0, 0.002, n),
+                         "z_type": "spec", "logmstar": rng.normal(9.0, 0.4, n),
+                         "p_in_window": 1.0})

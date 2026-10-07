@@ -46,3 +46,16 @@ button:hover { filter: brightness(1.1); }
   overflow-x: auto; margin: 8px 0 0; }
 @media (max-width: 900px) { .body { flex-direction: column; } .sidebar { width: auto;
   flex: none; position: static; max-height: none; } }
+.conc-summary { font-size: 13px; line-height: 1.5; margin: 4px 0 6px; }
+.conc-table-wrap { overflow-x: auto; margin-top: 6px; }
+.conc-table { border-collapse: collapse; font-size: 12px; width: 100%; }
+.conc-table th, .conc-table td { border-bottom: 1px solid var(--line); padding: 3px 8px;
+  text-align: right; white-space: nowrap; }
+.conc-table th:first-child, .conc-table td:first-child { text-align: left; white-space: normal; }
+.conc-table th { color: var(--ink2); font-weight: 600; }
+.pick-controls { margin: 2px 0 6px; }
+.pick-controls .row.tight { gap: 8px; margin-bottom: 4px; }
+.pick-controls button { padding: 3px 9px; font-size: 12px; }
+.pick-controls button:disabled { opacity: 0.45; cursor: default; }
+.pick-controls .check { white-space: nowrap; }
+.pick-controls .hint { max-width: 760px; }
