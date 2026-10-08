@@ -8,7 +8,7 @@ from .config import ConfigError, load_config
 from .validation import format_summary, validate_photoz
 
 
-def serve(cfg, host="127.0.0.1", port=8050, debug=False):
+def serve(cfg, host="127.0.0.1", port=8765, debug=False):
     """Load the explorer for cfg and serve the Dash app (blocks until interrupted)."""
     from .explorer import Explorer
 
@@ -55,7 +55,7 @@ def main(argv=None):
     p_serve = sub.add_parser("serve", help="run the interactive explorer (Dash app)")
     p_serve.add_argument("config", help="path to the YAML config file")
     p_serve.add_argument("--host", default="127.0.0.1", help="address to bind (default 127.0.0.1)")
-    p_serve.add_argument("--port", type=int, default=8050, help="port (default 8050)")
+    p_serve.add_argument("--port", type=int, default=8765, help="port (default 8765)")
     p_serve.add_argument("--debug", action="store_true",
                          help="Dash debug mode (error display in the browser; no reloader)")
 

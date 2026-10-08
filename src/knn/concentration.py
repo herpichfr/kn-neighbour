@@ -7,36 +7,54 @@ and sky_grid turn the result into the polylines and the colour map of the web ap
 compute_model(df, result, spec) fits the density profile around peaks and paths chosen
 by the user (default_spec: all of them) and returns the model_ columns.
 
-The equivalent of the legacy plot (a scipy gaussian_kde of RA, Dec over the whole
-field, src/calculate_kn_neighbour.py plot_kn_neighbour), with a weight per galaxy.
+A k-th nearest-neighbour surface density map of the galaxies of the slice (the k-th
+proximity relation), with a weight per galaxy (the legacy plot of
+src/calculate_kn_neighbour.py plot_kn_neighbour drew a Gaussian-kernel density map; that
+estimator is no longer used here).
 The map is read like a mountain range: the centre of the cluster is the highest peak,
-the contours are levels above the mean, and the ridges join the peaks along the
-higher ground between them (every peak is connected, a ridge can branch and can run
-off the map).
+the contours are levels above the mean, and the ridges follow the higher ground between
+the peaks, only where it stays at or above a floor of several sigma (a ridge can branch
+and can run off the map; a peak can have no ridge at all).
 
 Map
     Galaxies of the sample are projected on the tangent plane (gnomonic) at the
     mean position of the catalogue and scaled to proper Mpc at the cluster distance
     D_A(z_cl); every galaxy is assumed to lie at that distance, so sizes are right
-    only for a narrow redshift slice. A weighted 2D histogram is smoothed with a
-    Gaussian of standard deviation h (the bandwidth); the result is a weight surface
-    density (M_sun/Mpc^2 for the mass weight). The default h is Scott's rule as in
-    scipy.stats.gaussian_kde, h = sigma n^(-1/(d+4)) with d = 2, n the number of
-    galaxies and sigma the geometric mean of the standard deviations of their
-    coordinates; it depends on the positions only, not on the weight.
+    only for a narrow redshift slice. At the centre p of every grid cell inside the
+    footprint, r_k(p) is the projected distance to the k-th nearest galaxy of the
+    sample (scipy cKDTree) and the surface density is Sigma(p) = W_k / A: W_k is the
+    sum of the weights of the k nearest galaxies (k for the count weight, so
+    Sigma = k / A) and A the area of the disc of radius r_k(p) inside the survey hull
+    (see Footprint). Sigma is in galaxies/Mpc^2 (M_sun/Mpc^2 for the mass weight).
+    k is the setting k (an integer, 2 <= k <= the number of galaxies of the sample
+    minus 1; default 10). The length scale h, reported as the kNN scale
+    (info['knn_scale_mpc']), is the median over the galaxies of the sample of the
+    distance to their k-th nearest neighbour, the galaxy itself excluded. It sets the
+    cell (pixel = h / 2 unless pixel_mpc is given) and every length of the model
+    (PEAK_SEARCH, SNAP_MAX, WINDOW, ... are in units of h). The map is not smoothed
+    with a kernel: it depends on the positions and the weights through the k nearest
+    galaxies only, so it is noisier than a kernel map at the same scale and has no
+    kernel width to subtract from a fitted width. What smooths it is the cell: the value of
+    a cell is the mean of the density at the SUBSAMPLES x SUBSAMPLES (3 x 3) points of a
+    regular sub-grid of the cell that are inside the survey hull (the cell centre if none is),
+    each with its own edge correction; the number of evaluations, cells x SUBSAMPLES^2, is
+    limited to MAX_EVALUATIONS. Everything below (levels, peaks, ridges, the model, the
+    conc_ columns) uses this cell map; conc_density of a galaxy is that map interpolated.
 
 Footprint
     The survey area is the convex hull of ALL the galaxies of the table (every row,
     any redshift) in the tangent plane, not of the galaxies of the slice. A cell
-    whose centre is inside the hull is part of the map and is never masked: with no
-    galaxy of the slice within reach it has density 0 (the darkest colour of a
-    linear scale from 0), not NaN. A cell outside the hull is NaN. The smoothed
-    weights are divided by the same smoothing of the footprint indicator (normalised
-    convolution), which removes most of the dilution at the border of the hull; the
-    divisor is floored at COVER_FLOOR = 0.2 so that the correction cannot blow up at
-    a sharp corner of the hull (it can raise the density there at most 5 times).
-    Weight that falls in a cell whose centre is outside the hull (a galaxy within
-    half a cell of the hull) is smoothed like the rest.
+    whose centre is inside the hull is part of the map and is never masked: there is
+    always a k-th neighbour, so its density is positive (a cell far from the sample
+    has a low one and is drawn dark). A cell outside the hull is NaN. Edge
+    correction: the disc of radius r_k around a cell near the border of the hull is
+    partly outside the survey, where no galaxy can be counted; A = pi r_k^2 f with f
+    the fraction of the disc inside the hull. f is computed numerically with the
+    DISC_POINTS points of a fixed area-uniform pattern (a sunflower spiral) in the
+    unit disc, scaled by r_k and tested with in_hull; a disc that is farther than r_k
+    from every edge has f = 1 and is not sampled. f is floored at COVER_FLOOR = 0.2
+    so that the correction cannot blow up at a sharp corner of the hull (it can raise
+    the density there at most 5 times).
 
 Weight
     count: 1; mass: 10**logmstar x p_in_window (0 without a mass); any other
@@ -45,6 +63,8 @@ Weight
     the positive weights of the sample (null: no cap): the stellar mass of
     MKW4 is so skewed that the 10 most massive galaxies change the raw mass
     map by up to 1.6 times the median level (0.6 with the 95th percentile cap).
+    Galaxies of the sample with weight 0 (for instance no mass) are neighbours like
+    the others: they take a place among the k nearest and add nothing to W_k.
 
 Levels
     mean and sigma are the mean and the standard deviation of the map over the
@@ -73,24 +93,31 @@ Ridges
     The merge tree is also the maximum spanning tree (MST) of the 8-connected graph of the
     cells with edge weight = the lower density of the two cells, so the path between two
     cells in it is the maximin (bottleneck) path, the one whose lowest point (the saddle)
-    is highest: the crest between them. The union of the MST paths between all pairs of a
-    set of cells is the Steiner subtree of the MST that spans them; the ridge network is
-    that subtree for the terminals below, cut into segments. There is no level threshold:
-    a segment is drawn whatever its saddle (kept, in n sigma, to style it), so every
-    significant peak is connected to the rest, a ridge can pass through a branch point
-    (a local maximum along the crest) to more than one peak, and a ridge can run off the
-    map. With one significant peak and no border end there is no segment.
-    Terminals: every significant peak, and the border ends. The border is the cells of
-    the footprint with a neighbour outside it; its cells at or above the 1 sigma level
-    are grouped in 8-connected components, and the highest cell of a component is a
-    border end, unless a significant peak lies within BORDER_PEAK_CELLS = 2 cells
-    (Chebyshev distance) of any cell of the component: that peak is then the open end.
-    Nodes: the terminals and the junctions, the cells of the subtree (rooted at the
-    global maximum) with two or more branches. A segment is the path in the subtree from
-    a node up to the next node towards the root, both ends included. Its kind is 'peak'
-    (both ends are peaks), 'junction' (an end is a junction, none a border end) or
-    'boundary' (an end is a border end; the segment is open). Segments are lines, smoothed
-    with a 5-point mean (ends fixed), without a width: the model has the widths.
+    is highest: the crest between them. The ridge network lives on the cells at or above
+    the ridge floor, mean + ridge_floor_sigma x sigma (default 5, at least 1): the MST
+    restricted to those cells is a forest (the maximum spanning forest of the graph of
+    the cells above the floor), so a ridge never crosses ground below the floor and the
+    saddle of every segment is at or above it. In each connected component of the forest
+    that holds at least two terminals (below), the network is the Steiner subtree of the
+    forest that spans them (the union of the forest paths between all pairs of
+    terminals), cut into segments. A significant peak that is the only terminal of its
+    component, or that lies below the floor, gets no ridge (degree 0); a map can have no
+    ridge at all. A segment is kept whatever its saddle above the floor (kept, in n
+    sigma, to describe it), a ridge can pass through a branch point (a local maximum
+    along the crest) to more than one peak, and a ridge can run off the map.
+    Terminals: every significant peak at or above the floor, and the border ends. The
+    border is the cells of the footprint with a neighbour outside it; its cells at or
+    above the floor are grouped in 8-connected components, and the highest cell of a
+    component is a border end, unless a significant peak lies within BORDER_PEAK_CELLS = 2
+    cells (Chebyshev distance) of any cell of the component: that peak is then the open
+    end.
+    Nodes: the terminals that are in a component with a ridge and the junctions, the
+    cells of the subtree (rooted at the highest terminal of its component) with two or
+    more branches. A segment is the path in the subtree from a node up to the next node
+    towards the root, both ends included. Its kind is 'peak' (both ends are peaks),
+    'junction' (an end is a junction, none a border end) or 'boundary' (an end is a
+    border end; the segment is open). Segments are lines, smoothed with a 5-point mean
+    (ends fixed), without a width: the model has the widths.
 
 Inside
     A galaxy is inside when the map value at its position (bilinear, the map
@@ -102,15 +129,17 @@ Inside
     for galaxies outside the sample, against the map of the sample.
 
 Model
-    The user picks peaks (positions on the sky) and paths (the segments of the network
-    or polylines drawn on the sky); compute_model snaps and fits them, all lengths in
-    units of the bandwidth h of the map (the map is the true profile convolved with h).
+    The user picks peaks (positions on the sky: the peaks of the map, or points added by
+    hand) and paths (the segments of the network or polylines drawn on the sky);
+    compute_model snaps and fits them, all lengths in units of the kNN scale h.
     Peak: the highest footprint cell within PEAK_SEARCH = 1 h of the given position,
     moved to the vertex of a 3-point parabola in x and in y (at most half a cell). The
     mean map in annuli of one cell out to PROFILE_RADIUS = 4 h is fitted with
     B + A exp(-r^2 / (2 s^2)) (A, B >= 0, half a cell <= s <= 4 h; a failed fit uses the
     half-maximum radius over sqrt(2 ln 2)). The 1 sigma region of the peak is the disc of
-    radius s; the intrinsic width is sqrt(s^2 - h^2).
+    radius s. The width s is that of the Gaussian that fits the kNN map: there is no
+    smoothing kernel in the map, so no intrinsic width (sqrt(s^2 - h^2) of a Gaussian-kernel
+    map) is defined, and s still contains the resolution of the map (about h).
     Path: the points inside the survey area, smoothed lightly (5-point mean) and resampled
     at one cell: points q_k with unit normals n_k that stay fixed. Each point takes the
     profile of the map along n_k within SNAP_MAX = 1 h either side (-inf outside the hull)
@@ -145,19 +174,25 @@ import pandas as pd
 from scipy import ndimage
 from scipy.optimize import OptimizeWarning, curve_fit
 from scipy.sparse import coo_matrix
-from scipy.sparse.csgraph import breadth_first_order
+from scipy.sparse.csgraph import breadth_first_order, connected_components
 from scipy.spatial import ConvexHull, cKDTree
 
 WEIGHT_SPECIAL = ("count", "mass")
 SAMPLES = ("all", "spec")
 CONC_DEFAULTS = {"sample": "all", "z_range": None, "weight": "mass", "weight_clip": 95.0,
-                 "bandwidth_mpc": None, "pixel_mpc": None, "contour_step_sigma": 1.0,
-                 "min_prominence_sigma": 1.0}
-PIXELS_PER_BANDWIDTH = 4.0
+                 "k": 10, "pixel_mpc": None, "contour_step_sigma": 1.0,
+                 "min_prominence_sigma": 1.0, "ridge_floor_sigma": 5.0}
+PIXELS_PER_SCALE = 2.0
+SUBSAMPLES = 3
 MARGIN_PIXELS = 3
 COVER_FLOOR = 0.2
+DISC_POINTS = 128
+EDGE_CHUNK = 2000
+KNN_CHUNK = 100_000          # density evaluations per chunk
+MIN_RIDGE_FLOOR = 1.0
 MAX_LEVELS = 12
 MAX_CELLS = 2_000_000
+MAX_EVALUATIONS = 12_000_000     # cells x SUBSAMPLES^2
 MIN_SAMPLE = 30
 RIDGE_POINT_STEP = 0.25
 BORDER_PEAK_CELLS = 2
@@ -189,6 +224,17 @@ def conc_settings(cfg, **overrides):
         if value is not None:
             settings[key] = value
     return settings
+
+
+def _neighbour_count(k, n):
+    """k as an int, checked: an integer with 2 <= k <= n - 1 (n galaxies in the sample)."""
+    if (isinstance(k, bool) or not isinstance(k, (int, float, np.integer, np.floating))
+            or not float(k).is_integer()):
+        raise ConcentrationError(f"k must be an integer, got {k!r}")
+    if not 2 <= k <= n - 1:
+        raise ConcentrationError(f"k = {int(k)} must be between 2 and {n - 1} (the sample has "
+                                 f"{n} galaxies)")
+    return int(k)
 
 
 def default_sample(df, settings):
@@ -274,15 +320,6 @@ def galaxy_weights(df, sample, weight, clip=None, values=None):
     return w, {"clip_value": cap, "n_eff": n_eff}
 
 
-def scott_bandwidth(x, y):
-    """Scott's rule h = sigma n^(-1/6) (scipy gaussian_kde, d = 2).
-
-    sigma is the geometric mean of the standard deviations of x and y.
-    """
-    n = len(x)
-    return float(np.sqrt(np.std(x) * np.std(y)) * n ** (-1.0 / 6.0))
-
-
 def survey_hull(x, y):
     """Convex hull of the points as a dict: vertices (m, 2) counter-clockwise, equations (m, 3).
 
@@ -303,33 +340,111 @@ def in_hull(hull, px, py, tol=1e-9):
     return inside.reshape(np.shape(px))
 
 
-def density_map(x, y, w, hull, h, pixel):
-    """Edge-corrected Gaussian-smoothed weighted map on a regular grid (Mpc).
+def knn_scale(x, y, k):
+    """Median distance from each galaxy to its k-th nearest other galaxy (the kNN scale h, Mpc).
 
-    x, y (n,) positions of the galaxies of the sample, w (n,) weights, hull the
-    survey hull (survey_hull), h the kernel standard deviation, pixel the cell
-    size. The grid covers the hull with MARGIN_PIXELS empty cells around it, so no
-    cell of the footprint touches the edge of the array. Returns a dict: dens (ny,
-    nx) weight per Mpc^2 (NaN outside the hull, 0 for an empty cell inside), footprint
-    (bool: cell centre inside the hull), x0, y0 (lower left corner), pixel.
+    x, y (n,) positions of the galaxies of the sample; k < n. The galaxy itself is not counted.
     """
+    pts = np.column_stack([x, y])
+    return float(np.median(cKDTree(pts).query(pts, k=k + 1, workers=-1)[0][:, k]))
+
+
+def _unit_disc(n=DISC_POINTS):
+    """n points spread uniformly over the unit disc (a fixed sunflower spiral), shape (n, 2)."""
+    i = np.arange(n) + 0.5
+    r, t = np.sqrt(i / n), i * np.pi * (3.0 - np.sqrt(5.0))
+    return np.column_stack([r * np.cos(t), r * np.sin(t)])
+
+
+def disc_hull_fraction(hull, cx, cy, r):
+    """Fraction of the area of the discs (centres cx, cy, radii r) that lies inside the hull.
+
+    Numerical: the DISC_POINTS points of the fixed unit-disc pattern, scaled by r around the
+    centre and tested with in_hull; a disc whose centre is farther than r from every edge of
+    the hull (hull['equations'] are unit normals) has fraction 1 and is not sampled.
+    cx, cy, r: (n,) arrays; returns an (n,) array in [0, 1].
+    """
+    cx, cy, r = (np.asarray(a, dtype=float).ravel() for a in (cx, cy, r))
+    eq, disc = hull["equations"], _unit_disc()
+    frac = np.ones(len(cx))
+    for start in range(0, len(cx), EDGE_CHUNK):
+        sel = np.arange(start, min(start + EDGE_CHUNK, len(cx)))
+        gap = -(np.column_stack([cx[sel], cy[sel]]) @ eq[:, :2].T + eq[:, 2]).max(axis=1)
+        sel = sel[gap < r[sel]]
+        if len(sel):
+            px = cx[sel, None] + r[sel, None] * disc[None, :, 0]
+            py = cy[sel, None] + r[sel, None] * disc[None, :, 1]
+            frac[sel] = in_hull(hull, px, py).mean(axis=1)
+    return frac
+
+
+def _knn_density(tree, w, hull, px, py, k):
+    """(density, r_k, disc fraction) of the kNN map at the points (px, py): the weight of the k
+    nearest galaxies over pi r_k^2 max(f, COVER_FLOOR), f = disc_hull_fraction."""
+    dist, idx = tree.query(np.column_stack([px, py]), k=k, workers=-1)
+    r = np.maximum(dist[:, -1], 1e-9)
+    frac = disc_hull_fraction(hull, px, py, r)
+    return w[idx].sum(axis=1) / (np.pi * r ** 2 * np.maximum(frac, COVER_FLOOR)), r, frac
+
+
+def knn_map(x, y, w, hull, k, pixel, subsamples=None):
+    """Edge-corrected k-th nearest-neighbour surface density map on a regular grid (Mpc).
+
+    x, y (n,) positions of the galaxies of the sample, w (n,) weights, hull the survey hull
+    (survey_hull), k the number of neighbours, pixel the cell size, subsamples (n; default
+    SUBSAMPLES) the sub-grid of the cell. The grid covers the hull with MARGIN_PIXELS empty
+    cells around it, so no cell of the footprint touches the edge of the array. The density at
+    a point is the sum of the weights of the k nearest galaxies over A = pi r_k^2 f, r_k the
+    distance to the k-th and f the fraction of the disc of radius r_k inside the hull
+    (disc_hull_fraction), floored at COVER_FLOOR. The value of a cell is the mean of the density
+    at the n x n points of a regular sub-grid of the cell (offsets ((i + 0.5) / n - 0.5) pixel
+    from the centre) that are inside the hull; a cell whose centre is inside the hull but none
+    of whose sub-points is takes the value at its centre. With n = 1 it is the value at the
+    centre. Returns a dict: dens (ny, nx) weight per Mpc^2 (NaN outside the hull), footprint
+    (bool: cell centre inside the hull), rk (ny, nx) and cover (ny, nx) the distance to the k-th
+    neighbour (Mpc) and the fraction f before the floor, averaged like dens over the
+    sub-points (NaN outside), x0, y0 (lower left corner), pixel, subsamples.
+    """
+    n = int(SUBSAMPLES if subsamples is None else subsamples)
+    if n < 1:
+        raise ConcentrationError("subsamples must be at least 1")
     vx, vy = hull["vertices"][:, 0], hull["vertices"][:, 1]
     x0, y0 = float(vx.min() - MARGIN_PIXELS * pixel), float(vy.min() - MARGIN_PIXELS * pixel)
     nx = int(np.ceil((vx.max() + MARGIN_PIXELS * pixel - x0) / pixel))
     ny = int(np.ceil((vy.max() + MARGIN_PIXELS * pixel - y0) / pixel))
     if nx * ny > MAX_CELLS:
         raise ConcentrationError(f"the map would have {nx * ny} cells (maximum {MAX_CELLS}): "
-                                 "use a larger bandwidth or pixel")
+                                 "use a larger pixel or k")
     gx, gy = np.meshgrid(x0 + (np.arange(nx) + 0.5) * pixel, y0 + (np.arange(ny) + 0.5) * pixel)
     footprint = in_hull(hull, gx, gy)
-    box = [[y0, y0 + ny * pixel], [x0, x0 + nx * pixel]]
-    weighted = np.histogram2d(y, x, bins=[ny, nx], range=box, weights=w)[0]
-    sigma = h / pixel
-    num = ndimage.gaussian_filter(weighted, sigma, mode="constant")
-    cover = ndimage.gaussian_filter(footprint.astype(float), sigma, mode="constant")
-    dens = np.maximum(num, 0.0) / np.maximum(cover, COVER_FLOOR) / pixel ** 2
-    return {"dens": np.where(footprint, dens, np.nan), "footprint": footprint,
-            "x0": x0, "y0": y0, "pixel": float(pixel)}
+    cells = np.flatnonzero(footprint.ravel())
+    if len(cells) * n * n > MAX_EVALUATIONS:
+        raise ConcentrationError(f"the map would need {len(cells) * n * n} density evaluations "
+                                 f"(maximum {MAX_EVALUATIONS}): use a larger pixel or k")
+    cx, cy = gx.ravel()[cells], gy.ravel()[cells]
+    off = ((np.arange(n) + 0.5) / n - 0.5) * pixel
+    ox, oy = (a.ravel() for a in np.meshgrid(off, off))
+    tree = cKDTree(np.column_stack([x, y]))
+    dens, rk, cover = (np.full(nx * ny, np.nan) for _ in range(3))
+    step = max(KNN_CHUNK // (n * n), 1)
+    for start in range(0, len(cells), step):
+        sel = slice(start, start + step)
+        m = len(cx[sel])
+        sx, sy = cx[sel, None] + ox[None, :], cy[sel, None] + oy[None, :]
+        inside = in_hull(hull, sx, sy)
+        values = np.zeros((3, m * n * n))
+        flat = inside.ravel()
+        values[:, flat] = _knn_density(tree, w, hull, sx.ravel()[flat], sy.ravel()[flat], k)
+        count = inside.sum(axis=1)
+        mean = values.reshape(3, m, n * n).sum(axis=2) / np.maximum(count, 1)
+        none = np.flatnonzero(count == 0)
+        if len(none):                                   # no sub-point in the hull: the centre
+            mean[:, none] = _knn_density(tree, w, hull, cx[sel][none], cy[sel][none], k)
+        for out, value in zip((dens, rk, cover), mean):
+            out[cells[sel]] = value
+    return {"dens": dens.reshape(ny, nx), "footprint": footprint, "rk": rk.reshape(ny, nx),
+            "cover": cover.reshape(ny, nx), "x0": x0, "y0": y0, "pixel": float(pixel),
+            "subsamples": n}
 
 
 def contour_levels(mean, sigma, top, step, max_levels=MAX_LEVELS):
@@ -473,49 +588,68 @@ def _length(points):
     return float(np.hypot(*np.diff(points, axis=0).T).sum()) if len(points) > 1 else 0.0
 
 
-def ridge_network(dens, footprint, tree, peaks, level, grid, mean, sigma):
-    """Ridge network of the significant peaks: nodes and the segments between them.
+def ridge_network(dens, footprint, tree, peaks, floor_level, grid, mean, sigma):
+    """Ridge network of the significant peaks above the floor: nodes and the segments between them.
 
-    peaks: the list of peak dicts of compute_concentration (cell, id, height; the first is
-    the global maximum); level: the 1 sigma level; mean, sigma of the map. Each peak gets
-    its 'degree' (number of segments at its node). Returns (ridges, nodes), lists of dicts
-    with the keys documented in compute_concentration. See the module docstring for the
-    rules: Steiner subtree of the maximum spanning tree over the peaks and the border
-    ends, cut at the terminals and the junctions.
+    peaks: the list of peak dicts of compute_concentration (cell, id, height); floor_level: the
+    density of the ridge floor (mean + ridge_floor_sigma x sigma); mean, sigma of the map. Each
+    peak gets its 'degree' (number of segments at its node, 0 without a ridge). Returns (ridges,
+    nodes), lists of dicts with the keys documented in compute_concentration (a ridge also has
+    'component', the number of the connected piece of the network, from 1). See the module
+    docstring for the rules: Steiner subtree of the maximum spanning forest of the cells at or
+    above the floor, over the peaks and the border ends of each of its components that holds at
+    least two of them, cut at the terminals and the junctions.
     """
     nx = dens.shape[1]
     flat = np.where(footprint, dens, -np.inf).ravel()
+    n_cells = flat.size
     a, b = tree["edges"]
-    graph = coo_matrix((np.ones(2 * len(a)), (np.concatenate([a, b]), np.concatenate([b, a]))),
-                       shape=(flat.size, flat.size)).tocsr()
+    keep = flat[a] >= floor_level      # a is the lower cell of an edge: both ends are above the floor
+    a, b = a[keep], b[keep]
+    rows, cols = np.concatenate([a, b]), np.concatenate([b, a])
+    forest = coo_matrix((np.ones(len(rows)), (rows, cols)), shape=(n_cells, n_cells)).tocsr()
+    comp = connected_components(forest, directed=False)[1]
     pixel = grid["pixel"]
     border = footprint & ~ndimage.binary_erosion(footprint, structure=np.ones((3, 3)),
                                                  border_value=0)
-    labels, n_labels = ndimage.label(border & (np.where(footprint, dens, -np.inf) >= level),
+    labels, n_labels = ndimage.label(border & (np.where(footprint, dens, -np.inf) >= floor_level),
                                      structure=np.ones((3, 3)))
+    kind = {p["cell"]: "peak" for p in peaks if flat[p["cell"]] >= floor_level}
     near = set()
-    for p in peaks:
-        row, col = divmod(p["cell"], nx)
+    for cell in kind:
+        row, col = divmod(cell, nx)
         window = labels[max(row - BORDER_PEAK_CELLS, 0):row + BORDER_PEAK_CELLS + 1,
                         max(col - BORDER_PEAK_CELLS, 0):col + BORDER_PEAK_CELLS + 1]
         near.update(np.unique(window).tolist())
     free = [lab for lab in range(1, n_labels + 1) if lab not in near]
-    kind = {p["cell"]: "peak" for p in peaks}
     if free:
         top = ndimage.maximum_position(np.where(footprint, dens, -np.inf), labels, index=free)
         kind.update({int(r) * nx + int(c): "border" for r, c in top})
-    root = peaks[0]["cell"]
-    pred = breadth_first_order(graph, root, directed=True, return_predecessors=True)[1]
-    marked = {root}
+    by_comp = {}
     for cell in kind:
+        by_comp.setdefault(int(comp[cell]), []).append(cell)
+    root_of = {c: max(cells, key=lambda cell: (flat[cell], -cell))
+               for c, cells in by_comp.items() if len(cells) >= 2}
+    if root_of:
+        # a virtual node (index n_cells) above the root of every component: one search for all
+        rows = np.concatenate([rows, np.full(len(root_of), n_cells)])
+        cols = np.concatenate([cols, list(root_of.values())])
+        tree_graph = coo_matrix((np.ones(len(rows)), (rows, cols)),
+                                shape=(n_cells + 1, n_cells + 1)).tocsr()
+        pred = breadth_first_order(tree_graph, n_cells, directed=True,
+                                   return_predecessors=True)[1]
+    roots = set(root_of.values())
+    marked = set(roots)
+    for cell in kind:
+        if int(comp[cell]) not in root_of:
+            continue
         path = []
-        while cell not in marked and pred[cell] >= 0:
+        while cell not in marked:
             path.append(cell)
             cell = int(pred[cell])
-        if cell in marked:
-            marked.update(path)
+        marked.update(path)
     branches = {}
-    for cell in marked - {root}:
+    for cell in marked - roots:
         branches[int(pred[cell])] = branches.get(int(pred[cell]), 0) + 1
     for cell in marked:
         if cell not in kind and branches.get(cell, 0) >= 2:
@@ -540,7 +674,7 @@ def ridge_network(dens, footprint, tree, peaks, level, grid, mean, sigma):
                                         grid["y0"] + (rows + 0.5) * pixel]))
 
     segments = []
-    for cell in sorted(node_cells - {root}):
+    for cell in sorted(node_cells - roots):
         cells = [cell]
         while True:
             cells.append(int(pred[cells[-1]]))
@@ -548,7 +682,7 @@ def ridge_network(dens, footprint, tree, peaks, level, grid, mean, sigma):
                 break
         segments.append(cells)
     segments.sort(key=lambda cells: -float(flat[cells].min()))
-    ridges = []
+    ridges, number = [], {}
     for k, cells in enumerate(segments, start=1):
         low, up = node_of[cells[0]], node_of[cells[-1]]
         kinds = {low["kind"], up["kind"]}
@@ -559,7 +693,9 @@ def ridge_network(dens, footprint, tree, peaks, level, grid, mean, sigma):
                        "open": "border" in kinds, "peaks": [low["peak"], up["peak"]],
                        "nodes": [low["id"], up["id"]], "saddle": saddle,
                        "saddle_n_sigma": (saddle - mean) / sigma, "points": pts,
-                       "length": _length(pts), "cells": [int(c) for c in cells]})
+                       "length": _length(pts),
+                       "component": number.setdefault(int(comp[cells[0]]), len(number) + 1),
+                       "cells": [int(c) for c in cells]})
         low["degree"] += 1
         up["degree"] += 1
     for p in peaks:
@@ -661,8 +797,10 @@ def compute_concentration(df, sample, settings, cosmo, z_cluster, values=None):
     Returns (columns, result). columns (arrays of len(df), for every row, not only the
     sample): COLUMNS. result: dict with grid (x0, y0, pixel, shape, ra0, dec0, d_a),
     dens (ny, nx; NaN outside the hull), filled (dens with the nearest footprint value
-    outside the hull), footprint (bool), hull (survey_hull), mean, sigma, level (the 1
-    sigma level), top (map maximum), n_sigma and levels (arrays), contours (one dict per
+    outside the hull), footprint (bool), hull (survey_hull), rk (ny, nx: distance to the
+    k-th neighbour, Mpc), cover (ny, nx: fraction of that disc inside the hull, before the
+    floor), k, knn_scale (h, Mpc), mean, sigma, level (the 1 sigma level), floor_level (the
+    ridge floor), top (map maximum), n_sigma and levels (arrays), contours (one dict per
     level: n_sigma, level, lines (list of (m, 2) arrays in Mpc), closed (list of bool)),
     peaks (the significant peaks: id from 1 by height, cell, row, col, x, y in Mpc,
     height, n_sigma, prominence, prominence_sigma, open, significant), all_peaks
@@ -670,7 +808,8 @@ def compute_concentration(df, sample, settings, cosmo, z_cluster, values=None):
     degree, the number of ridge segments at their node), ridges (the segments of the ridge
     network, id from 1 by decreasing saddle: kind 'peak' | 'junction' | 'boundary', open,
     peaks (ids of the two ends, lower end first, None for a junction or border end), nodes
-    (ids of the two ends), saddle, saddle_n_sigma, points ((m, 2) Mpc, smoothed), length,
+    (ids of the two ends), saddle, saddle_n_sigma (>= the floor), points ((m, 2) Mpc,
+    smoothed), length, component (number of the connected piece of the network, from 1),
     cells (flat indices of the unsmoothed path)), nodes (the ends of the segments, id from
     1: kind 'peak' | 'junction' | 'border', cell, x, y (Mpc), peak (id or None), height,
     n_sigma, degree), regions (label image of the 1 sigma regions), info
@@ -683,6 +822,10 @@ def compute_concentration(df, sample, settings, cosmo, z_cluster, values=None):
     step, min_prom = float(settings["contour_step_sigma"]), float(settings["min_prominence_sigma"])
     if step <= 0 or min_prom < 0:
         raise ConcentrationError("contour_step_sigma must be > 0 and min_prominence_sigma >= 0")
+    floor_sigma = float(settings["ridge_floor_sigma"])
+    if not floor_sigma >= MIN_RIDGE_FLOOR:
+        raise ConcentrationError(f"ridge_floor_sigma must be >= {MIN_RIDGE_FLOOR:g} (the 1 sigma "
+                                 "level), got " + f"{settings['ridge_floor_sigma']!r}")
     ra, dec = df["ra"].to_numpy(float), df["dec"].to_numpy(float)
     finite = np.isfinite(ra) & np.isfinite(dec)
     d_a = float(cosmo.angular_diameter_distance(z_cluster).to_value(u.Mpc))
@@ -694,15 +837,20 @@ def compute_concentration(df, sample, settings, cosmo, z_cluster, values=None):
     if not (w > 0).any():
         raise ConcentrationError("all weights are zero in the sample")
     use = sample & finite
-    h_scott = scott_bandwidth(x[use], y[use])
-    h = float(settings["bandwidth_mpc"]) if settings["bandwidth_mpc"] else h_scott
-    pixel = float(settings["pixel_mpc"]) if settings["pixel_mpc"] else h / PIXELS_PER_BANDWIDTH
-    grid = density_map(x[use], y[use], w[use], hull, h, pixel)
+    k = _neighbour_count(settings["k"], int(use.sum()))
+    settings = {**settings, "k": k, "ridge_floor_sigma": floor_sigma}
+    h = knn_scale(x[use], y[use], k)
+    if not h > 0:
+        raise ConcentrationError("the kNN scale is zero (k galaxies share one position)")
+    pixel = float(settings["pixel_mpc"]) if settings["pixel_mpc"] else h / PIXELS_PER_SCALE
+    grid = knn_map(x[use], y[use], w[use], hull, k, pixel)
+    grid_ny, grid_nx = grid["dens"].shape
     dens, footprint = grid["dens"], grid["footprint"]
     mean, sigma = float(dens[footprint].mean()), float(dens[footprint].std())
     if not sigma > 0:
         raise ConcentrationError("the map is flat (zero standard deviation)")
     level, top = mean + sigma, float(dens[footprint].max())
+    floor_level = mean + floor_sigma * sigma
     n_sigma, levels = contour_levels(mean, sigma, top, step)
     lines = contour_lines(dens, footprint, grid, levels)
     contours = [{"n_sigma": float(n), "level": float(lv), "lines": ls,
@@ -728,7 +876,7 @@ def compute_concentration(df, sample, settings, cosmo, z_cluster, values=None):
             next_id += 1
     peaks = [p for p in all_peaks if p["significant"]]
     regions, n_regions = one_sigma_regions(dens, footprint, level)
-    ridges, nodes = ridge_network(dens, footprint, tree, peaks, level, grid, mean, sigma)
+    ridges, nodes = ridge_network(dens, footprint, tree, peaks, floor_level, grid, mean, sigma)
     filled = _filled(dens, footprint)
     filled_labels = _filled(regions, footprint)
     columns = _galaxy_columns(grid, filled, filled_labels, mean, sigma, level, ridges, x, y)
@@ -736,7 +884,9 @@ def compute_concentration(df, sample, settings, cosmo, z_cluster, values=None):
     grid_info = {"x0": grid["x0"], "y0": grid["y0"], "pixel": pixel, "shape": list(dens.shape),
                  "ra0": ra0, "dec0": dec0, "d_a": d_a}
     result = {"grid": grid_info, "dens": dens, "filled": filled, "footprint": footprint,
-              "hull": hull, "mean": mean, "sigma": sigma, "level": float(level), "top": top,
+              "hull": hull, "rk": grid["rk"], "cover": grid["cover"], "k": k, "knn_scale": h,
+              "mean": mean, "sigma": sigma, "level": float(level),
+              "floor_level": float(floor_level), "top": top,
               "n_sigma": n_sigma, "levels": levels, "contours": contours, "peaks": peaks,
               "all_peaks": all_peaks, "ridges": ridges, "nodes": nodes, "regions": regions,
               "info": None}
@@ -748,10 +898,9 @@ def compute_concentration(df, sample, settings, cosmo, z_cluster, values=None):
         "z_cluster": float(z_cluster), "d_a_mpc": d_a, "n_sample": int(sample.sum()),
         "n_weighted": int((sample & (w > 0)).sum()), "n_eff": winfo["n_eff"],
         "weight_clip_value": winfo["clip_value"], "n_rows": int(len(df)),
-        "bandwidth": {"mpc": h, "scott_mpc": h_scott,
-                      "source": ("config / app bandwidth" if settings["bandwidth_mpc"]
-                                 else "Scott's rule on the sample positions")},
-        "pixel_mpc": pixel, "cover_floor": COVER_FLOOR,
+        "k": k, "knn_scale_mpc": h, "pixel_mpc": pixel, "grid_nx": int(grid_nx),
+        "grid_ny": int(grid_ny), "subsamples": grid["subsamples"], "cover_floor": COVER_FLOOR,
+        "edge_disc_samples": DISC_POINTS,
         "hull_area_mpc2": hull["area"], "map_area_mpc2": float(footprint.sum() * pixel ** 2),
         "mean": mean, "sigma": sigma, "level_1sigma": float(level), "top": top,
         "top_n_sigma": (top - mean) / sigma,
@@ -761,7 +910,10 @@ def compute_concentration(df, sample, settings, cosmo, z_cluster, values=None):
         "peaks": [{"id": p["id"], "ra": float(r), "dec": float(d), "n_sigma": p["n_sigma"],
                    "prominence_sigma": p["prominence_sigma"], "open": p["open"]}
                   for p, r, d in zip(peaks, np.atleast_1d(peak_ra), np.atleast_1d(peak_dec))],
-        "n_ridges": len(ridges), "n_ridges_open": sum(r["open"] for r in ridges),
+        "ridge_floor_sigma": floor_sigma, "ridge_floor_level": float(floor_level),
+        "n_peaks_above_floor": sum(p["height"] >= floor_level for p in peaks),
+        "n_ridges": len(ridges), "n_ridge_components": len({r["component"] for r in ridges}),
+        "n_ridges_open": sum(r["open"] for r in ridges),
         "ridges_total_length_mpc": float(sum(r["length"] for r in ridges)),
         "n_junctions": sum(n["kind"] == "junction" for n in nodes),
         "n_border_ends": sum(n["kind"] == "border" for n in nodes),
@@ -844,9 +996,8 @@ def hull_sky(result):
 def sky_grid(result, step_deg=None):
     """The map resampled on a regular (RA, Dec) grid for plotting.
 
-    Returns (ra (nx,), dec (ny,), z (ny, nx)) with z = the map over its mean (0 for an
-    empty cell, NaN outside the survey hull; the position is tested against the hull,
-    not against the cells). The grid step defaults to the cell of the map in degrees.
+    Returns (ra (nx,), dec (ny,), z (ny, nx)) with z = the map over its mean (NaN outside
+    the survey hull; the position is tested against the hull, not against the cells). The grid step defaults to the cell of the map in degrees.
     """
     g, hull = result["grid"], result["hull"]
     step = step_deg or float(np.degrees(g["pixel"] / g["d_a"]))
@@ -1160,21 +1311,21 @@ def compute_model(df, result, spec):
     structure): model_dist_mpc (distance to the nearest structure), model_dist_sigma (the
     smallest distance / width over the structures), model_inside (model_dist_sigma <= 1),
     model_structure (label of the structure with that smallest value).
-    model: peaks (label, ra, dec, x, y, height, n_sigma, A, B, width_mpc,
-    width_intrinsic_mpc, fit_ok, shift_mpc, circle_ra, circle_dec), paths (label, ra, dec,
+    model: peaks (label, ra, dec, x, y, height, n_sigma, A, B, width_mpc, fit_ok,
+    shift_mpc, circle_ra, circle_dec), paths (label, ra, dec,
     x_mpc, y_mpc, input_ra, input_dec, left_ra, left_dec, right_ra, right_dec, width_mpc
-    (list), width_median_mpc, width_intrinsic_median_mpc, fit {A, s, B, ok},
+    (list), width_median_mpc, fit {A, s, B, ok},
     crest_n_sigma_mean, crest_n_sigma_min, length_mpc, shift_max_mpc, clamped_fraction,
     end_pin_mpc, n_iter, open; the band edges and circles are NaN outside the survey hull),
     skipped ({label, reason}), info (JSON-serialisable: n_peaks, n_paths, n_skipped,
-    bandwidth_mpc, counts, constants) and inside (the column model_inside).
+    knn_scale_mpc, counts, constants) and inside (the column model_inside).
     """
     peaks_in, paths_in = _check_spec(spec)
     if not peaks_in and not paths_in:
         raise ConcentrationError("select at least one peak or path")
     g, hull = result["grid"], result["hull"]
     dens, footprint, filled = result["dens"], result["footprint"], result["filled"]
-    h, pixel = float(result["info"]["bandwidth"]["mpc"]), float(g["pixel"])
+    h, pixel = float(result["info"]["knn_scale_mpc"]), float(g["pixel"])
     mean, sigma = result["mean"], result["sigma"]
     angle = np.linspace(0.0, 2.0 * np.pi, CIRCLE_POINTS + 1)
     skipped, peaks_out, paths_out, structures, refined = [], [], [], [], []
@@ -1199,7 +1350,7 @@ def compute_model(df, result, spec):
         peaks_out.append({
             "label": label, "ra": float(sky[0][0]), "dec": float(sky[1][0]), "x": x, "y": y,
             "height": height, "n_sigma": (height - mean) / sigma, "A": a, "B": b,
-            "width_mpc": s, "width_intrinsic_mpc": float(np.sqrt(max(s ** 2 - h ** 2, 0.0))),
+            "width_mpc": s,
             "fit_ok": status != "fail", "shift_mpc": float(np.hypot(x - gx, y - gy)),
             "circle_ra": circle[0].tolist(), "circle_dec": circle[1].tolist()})
         structures.append({"label": label, "points": np.array([[x, y]]), "width": np.array([s])})
@@ -1232,7 +1383,6 @@ def compute_model(df, result, spec):
             "left_ra": left[0].tolist(), "left_dec": left[1].tolist(),
             "right_ra": right[0].tolist(), "right_dec": right[1].tolist(),
             "width_mpc": width.tolist(), "width_median_mpc": median,
-            "width_intrinsic_median_mpc": float(np.sqrt(max(median ** 2 - h ** 2, 0.0))),
             "fit": {"A": whole[0], "s": whole[1], "B": whole[2], "ok": whole[3] == "ok"},
             "crest_n_sigma_mean": float(np.nanmean(crest)),
             "crest_n_sigma_min": float(np.nanmin(crest)), "length_mpc": _length(pts),
@@ -1264,7 +1414,7 @@ def compute_model(df, result, spec):
                "model_structure": who}
     spec_z = df["z_type"].to_numpy(object) == "spec"
     info = {"n_peaks": len(peaks_out), "n_paths": len(paths_out), "n_skipped": len(skipped),
-            "bandwidth_mpc": h,
+            "knn_scale_mpc": h,
             "counts": {"inside_spec": int((inside & spec_z).sum()),
                        "inside_phot": int((inside & ~spec_z).sum()),
                        "outside_spec": int((~inside & spec_z).sum()),
@@ -1292,18 +1442,16 @@ def describe_model(model, mask=None, df=None):
     """Lines of text summarising a model; with mask and df the counts are those of the mask."""
     info, c = model["info"], model["info"]["counts"]
     skipped = "".join(f" {s['label']} skipped ({s['reason']})." for s in model["skipped"])
-    lines = [f"Model: {info['n_peaks']} peaks and {info['n_paths']} paths, bandwidth "
-             f"{info['bandwidth_mpc']:.2f} Mpc.{skipped}"]
+    lines = [f"Model: {info['n_peaks']} peaks and {info['n_paths']} paths, kNN scale "
+             f"{info['knn_scale_mpc']:.2f} Mpc.{skipped}"]
     for p in model["peaks"]:
         lines.append(f"{p['label']}: {p['n_sigma']:.1f} sigma, 1 sigma radius {p['width_mpc']:.2f} "
-                     f"Mpc (intrinsic {p['width_intrinsic_mpc']:.2f})"
-                     + ("" if p["fit_ok"] else ", profile fit failed"))
+                     "Mpc" + ("" if p["fit_ok"] else ", profile fit failed"))
     for p in model["paths"]:
         lines.append(f"{p['label']}: {p['length_mpc']:.1f} Mpc, crest "
                      f"{p['crest_n_sigma_mean']:.1f} sigma (lowest {p['crest_n_sigma_min']:.1f}), "
                      f"1 sigma half-width "
-                     f"{p['width_median_mpc']:.2f} Mpc (intrinsic "
-                     f"{p['width_intrinsic_median_mpc']:.2f}), moved up to "
+                     f"{p['width_median_mpc']:.2f} Mpc, moved up to "
                      f"{p['shift_max_mpc']:.2f} Mpc"
                      + (f", no crest within {SNAP_MAX:g} h of the drawn path along "
                         f"{100 * p['clamped_fraction']:.0f} % of it" if p["clamped_fraction"] > 0
@@ -1325,21 +1473,25 @@ def describe_model(model, mask=None, df=None):
 
 def describe(info):
     """Lines of text summarising the info of compute_concentration."""
-    s, b, c = info["settings"], info["bandwidth"], info["counts"]
+    s, c = info["settings"], info["counts"]
     weight = s["weight"] + (f" (capped at the {s['weight_clip']:g}th percentile)"
                             if s["weight_clip"] else "")
     levels = info["contour_levels_n_sigma"]
     lines = [
-        f"Map of {info['n_sample']} galaxies ({s['sample']}), weight {weight}, bandwidth "
-        f"{b['mpc']:.2f} Mpc ({b['source']}), cell {info['pixel_mpc']:.2f} Mpc, survey area "
+        f"Map of {info['n_sample']} galaxies ({s['sample']}), weight {weight}, k = {info['k']} "
+        f"nearest neighbours, kNN scale {info['knn_scale_mpc']:.2f} Mpc (median distance to the "
+        f"k-th neighbour), cell {info['pixel_mpc']:.2f} Mpc ({info['grid_nx']} x "
+        f"{info['grid_ny']} cells, mean of {info['subsamples']}^2 sub-points), survey area "
         f"{info['hull_area_mpc2']:.0f} Mpc^2 (hull of {info['n_rows']} galaxies).",
         f"Mean {info['mean']:.3g}, sigma {info['sigma']:.3g}, maximum {info['top_n_sigma']:.1f} "
         f"sigma; {len(levels)} contour levels from 1 sigma"
         + (f" to {levels[-1]:.1f} sigma." if levels else ".")]
     lines.append(f"Peaks: {info['n_peaks']} significant (prominence >= "
                  f"{s['min_prominence_sigma']:g} sigma), "
-                 f"{sum(p['open'] for p in info['peaks'])} open; ridges: {info['n_ridges']} "
-                 f"segments, {info['n_junctions']} branch points, {info['n_ridges_open']} open "
+                 f"{sum(p['open'] for p in info['peaks'])} open; ridges (floor "
+                 f"{info['ridge_floor_sigma']:g} sigma, {info['n_peaks_above_floor']} peaks above "
+                 f"it): {info['n_ridges']} segments in {info['n_ridge_components']} pieces, "
+                 f"{info['n_junctions']} branch points, {info['n_ridges_open']} open "
                  f"to the border, {info['ridges_total_length_mpc']:.1f} Mpc in total.")
     lines.append(f"Inside the 1 sigma contour: {c['inside_spec'] + c['inside_phot']} "
                  f"({c['inside_spec']} spec-z + {c['inside_phot']} photo-z); outside: "

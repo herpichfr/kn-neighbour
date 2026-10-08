@@ -16,12 +16,12 @@ from knn.concentration import (COLUMNS, ConcentrationError, default_spec, peak_t
 from knn.config import resolve_path
 from knn.explorer import MASS_TABLE_COLUMNS, mass_stats_table, wilson_interval
 from dash import no_update
+from conftest import CONC_SECTION
 
 # the fixtures conc_built and conc_explorer are in conftest.py
 SKY_TRACES = ["concentration", "survey area", "contours (2σ, 3σ, ...)", "1σ contour",
-              "ridges halo", "ridges to the border halo", "low-crest ridges halo", "ridges",
-              "ridges to the border", "low-crest ridges", "ridges off", "drawn paths",
-              "drawn paths off", "peaks", "spec-z", "photo-z"]
+              "ridges halo", "ridges to the border halo", "ridges", "ridges to the border",
+              "ridges off", "drawn paths", "drawn paths off", "peaks", "spec-z", "photo-z"]
 MODEL_TRACES = ["model: 1σ band", "model: peak circles", "model: fitted paths"]
 PEAKS, GALAXIES = SKY_TRACES.index("peaks"), SKY_TRACES.index("spec-z")
 
@@ -41,11 +41,10 @@ def test_build_writes_columns_and_summary_but_no_sidecar(conc_built):
     assert set(COLUMNS) <= set(df.columns) and df["conc_inside"].dtype == bool
     prov = json.loads(Path(str(output_path(cfg)) + ".provenance.json").read_text())
     info = prov["build_info"]["concentration"]
-    assert prov["config"]["concentration"] == {"z_range": [0.014, 0.028], "sample": "all",
-                                               "weight": "mass"}
+    assert prov["config"]["concentration"] == CONC_SECTION
     assert info["n_peaks"] >= 2 and info["n_rows"] == len(df)
     assert {"mean", "sigma", "level_1sigma", "contour_levels", "n_ridges", "pixel_mpc",
-            "counts"} <= set(info) and info["bandwidth"]["mpc"] > 0
+            "counts"} <= set(info) and info["knn_scale_mpc"] > 0 and info["k"] == 20
     assert "lines" not in json.dumps(info) and "points" not in json.dumps(info)
     assert [k for k in prov["build_info"] if k.endswith("_file")] == ["tracers_file"]
     out = output_path(cfg)                                # no sidecar next to the catalogue
@@ -73,8 +72,9 @@ def test_explorer_keeps_the_build_columns_and_reproduces_them_live(conc_explorer
     assert again[0] is columns and again[1] is result      # cached
     other = ex.concentration(weight="count")
     assert other[1]["info"]["settings"]["weight"] == "count" and other is not again
-    assert ex.default_concentration() == {"weight": "mass", "bandwidth_mpc": None,
-                                          "contour_step_sigma": 1.0, "min_prominence_sigma": 1.0}
+    assert ex.default_concentration() == {"weight": "mass", "k": 20, "pixel_mpc": None,
+                                          "contour_step_sigma": 1.0,
+                                          "min_prominence_sigma": 6.0, "ridge_floor_sigma": 1.0}
     with pytest.raises(ConcentrationError, match="only 3 galaxies"):
         ex.concentration(np.arange(len(ex.df)) < 3)
 
@@ -94,20 +94,57 @@ def test_inside_outside_sample_filter(conc_explorer):
     assert spec.sum() > 0 and not (spec & ex.is_phot).any()
     with pytest.raises(ValueError, match="conc_region"):
         ex.select({"conc_region": "near"})
-    state = cb.make_state(ex, concregion="inside", concw="count", conch=1.5, concstep=2.0,
-                          concprom=0.5)
+    state = cb.make_state(ex, concregion="inside", concw="count", conck=12, concstep=2.0,
+                          concprom=0.5, concfloor=3.0)
     f = cb.filters_from_state(ex, state)
     assert f["conc_region"] == "inside"
-    assert f["conc_params"] == {"weight": "count", "bandwidth_mpc": 1.5, "contour_step_sigma": 2.0,
-                                "min_prominence_sigma": 0.5}
+    assert f["conc_params"] == {"weight": "count", "k": 12, "pixel_mpc": None,
+                                "contour_step_sigma": 2.0, "min_prominence_sigma": 0.5,
+                                "ridge_floor_sigma": 3.0}
+    # a whole float from the number input is an int; an empty input falls back to the config
+    assert cb.conc_params(cb.make_state(ex, conck=12.0))["k"] == 12
+    assert isinstance(cb.conc_params(cb.make_state(ex, conck=12.0))["k"], int)
+    assert cb.conc_params(cb.make_state(ex, conck=None, concfloor=None))["k"] is None
+    assert cb.conc_params(cb.make_state(ex, conck=None, concfloor=None))["ridge_floor_sigma"] is None
     assert "conc_region" not in cb.filters_from_state(ex, default_state(ex))
+
+
+def test_the_map_pixel_control_and_state_key(conc_explorer):
+    ex = conc_explorer
+    st = default_state(ex)
+    assert st["concpix"] is None and "concpix" in cb.SAMPLE_KEYS
+    assert ("concpix", "conc-pix", "value") in STATE_CONTROLS
+    app = create_app(ex)
+    box = next(c for c in app.layout._traverse() if getattr(c, "id", None) == "conc-pix")
+    assert (box.type, box.min, box.step, box.placeholder, box.debounce) == (
+        "number", 0.05, 0.05, "h/2", True) and box.value is None and not box.disabled
+    # the control is the pixel_mpc setting; empty = h / 2
+    assert cb.conc_params(cb.make_state(ex, concpix=0.6))["pixel_mpc"] == 0.6
+    assert cb.conc_params(cb.make_state(ex, concpix=None))["pixel_mpc"] is None
+    default = cb.sample_info(ex, cb.make_state(ex))
+    coarse = cb.sample_info(ex, cb.make_state(ex, concpix=0.6))
+    assert coarse["conc"]["pixel_mpc"] == 0.6 and coarse["map_key"] != default["map_key"]
+    res0 = cb.concentration_result(ex, default)[1]["info"]
+    res1 = cb.concentration_result(ex, coarse)[1]["info"]
+    assert res0["pixel_mpc"] == pytest.approx(res0["knn_scale_mpc"] / 2.0)
+    assert res1["pixel_mpc"] == 0.6 and res1["grid_nx"] < res0["grid_nx"] * res0["pixel_mpc"] / 0.5
+    # the summary shows the pixel used and the grid
+    lines = cb.concentration_callback(ex, cb.env_info(ex, cb.make_state(ex)), coarse)[0]
+    assert f"cell 0.60 Mpc ({res1['grid_nx']} x {res1['grid_ny']} cells, mean of 3^2 sub-points)" in lines[0]
+    # in snapshots, and a snapshot without it still loads
+    text = ex.snapshot(cb.make_state(ex, concpix=0.6))
+    values, _ = cb.restore_state(ex, ex.load_snapshot(text))
+    assert dict(zip(STATE_KEYS, values))["concpix"] == 0.6
+    old = {k: v for k, v in st.items() if k != "concpix"}
+    assert dict(zip(STATE_KEYS, cb.restore_state(ex, {"state": old})[0]))["concpix"] is None
 
 
 def test_default_state_follows_the_config_slice(conc_explorer):
     st = default_state(conc_explorer)
     assert st["z_range"] == [0.014, 0.028] and st["z_types"] == ["spec", "phot"]
-    assert (st["concw"], st["conch"], st["concstep"], st["concprom"], st["concregion"]) == (
-        "mass", None, 1.0, 1.0, "any")
+    assert (st["concw"], st["conck"], st["concstep"], st["concprom"], st["concfloor"],
+            st["concregion"]) == ("mass", 20, 1.0, 6.0, 1.0, "any")
+    assert "coords" not in st and "conch" not in st
     options = conc_weight_options(conc_explorer)
     assert options[:2] == ["count", "mass"] and "logmstar" in options and "env" not in options
 
@@ -115,8 +152,8 @@ def test_default_state_follows_the_config_slice(conc_explorer):
 def test_sample_info_carries_the_controls_and_survives_a_tiny_sample(conc_explorer):
     ex = conc_explorer
     info = cb.sample_info(ex, default_state(ex))
-    assert info["conc"] == {"weight": "mass", "bandwidth_mpc": None, "contour_step_sigma": 1.0,
-                            "min_prominence_sigma": 1.0}
+    assert info["conc"] == {"weight": "mass", "k": 20, "pixel_mpc": None, "contour_step_sigma": 1.0,
+                            "min_prominence_sigma": 6.0, "ridge_floor_sigma": 1.0}
     tiny = cb.sample_info(ex, cb.make_state(ex, concregion="inside", z_range=[0.0140, 0.0141]))
     assert "1 sigma region filter off" in tiny["text"] and "conc_region" not in tiny["filters"]
     narrow = cb.sample_info(ex, cb.make_state(ex, concregion="inside"))
@@ -167,7 +204,22 @@ def test_sky_figure_has_map_contours_ridges_and_peaks(conc_explorer, conc_stores
     heat, hull, others, first = sky.data[0], sky.data[1], sky.data[2], sky.data[3]
     z = np.array(heat.z, dtype=float)
     assert z.shape == (len(heat.y), len(heat.x)) and np.isnan(z).any() and np.isfinite(z).any()
-    assert np.nanmin(z) >= 0.0 and heat.zmin == 0 and heat.opacity == 1.0
+    assert heat.opacity == 1.0 and heat.zmin == figures.MAP_FLOOR == -1.0
+    # log10(map / mean): floored at 0.1 x the mean, finite everywhere in the survey, the top is
+    # the 99.5th percentile (at least 1), the hover shows the linear map / mean
+    linear = np.array(cb.concentration_overlay(ex, sample)["map_z"], dtype=float)
+    assert np.array_equal(np.isnan(z), np.isnan(linear)) and np.nanmin(z) >= -1.0
+    np.testing.assert_allclose(z[np.isfinite(z)], np.log10(np.maximum(
+        linear[np.isfinite(linear)], 0.1)))
+    assert heat.zmax == pytest.approx(np.log10(max(np.percentile(linear[np.isfinite(linear)], 99.5),
+                                                   1.0)))
+    np.testing.assert_allclose(np.array(heat.customdata, dtype=float), linear, atol=5e-4,
+                               equal_nan=True)
+    assert "%{customdata:.2f}" in heat.hovertemplate and "%{z" not in heat.hovertemplate
+    assert heat.colorbar.title.text == "map / mean"
+    assert list(heat.colorbar.tickvals) == [np.log10(float(t)) for t in heat.colorbar.ticktext]
+    assert all(-1.0 - 1e-9 <= v <= heat.zmax + 1e-9 for v in heat.colorbar.tickvals)
+    assert "1" in heat.colorbar.ticktext
     assert heat.colorscale[0][1].lower().startswith("#0") and heat.colorscale[-1][1].lower().startswith("#f")
     # the border of the survey: a thin closed grey line
     assert hull.line.color == figures.HULL and hull.line.width <= 1.0
@@ -177,7 +229,7 @@ def test_sky_figure_has_map_contours_ridges_and_peaks(conc_explorer, conc_stores
     assert None in list(first.x) and len(first.x) == len(first.y)
     assert len(others.x) > 0 and first.customdata is None
     # ridges: cyan over wider dark halos, a halo hides with its line, open ones dashed
-    ridges, open_ridges = sky.data[7], sky.data[8]
+    ridges, open_ridges = sky.data[6], sky.data[7]
     halo, halo_open = sky.data[4], sky.data[5]
     assert ridges.line.color == figures.RIDGE and open_ridges.line.dash == "dash"
     assert ridges.line.dash == "solid" and halo.line.width > ridges.line.width
@@ -208,12 +260,12 @@ def test_sky_figure_has_map_contours_ridges_and_peaks(conc_explorer, conc_stores
     assert sky.layout.margin.b >= 140
     # galaxies are on top (drawn last) and keep their customdata
     assert sky.data[GALAXIES].customdata is not None and sky.data[GALAXIES].name == "spec-z"
-    # the map follows the controls: count weight, other bandwidth, density switch off
+    # the map follows the controls: count weight, other k (a smaller kNN scale), density switch off
     count_state = cb.make_state(ex, concw="count")
     count = cb.sky_callback(ex, count_state, env, cb.sample_info(ex, count_state))
     zc = np.array(count.data[0].z, dtype=float)
     assert zc.shape == z.shape and not np.allclose(np.nan_to_num(zc), np.nan_to_num(z))
-    narrow_state = cb.make_state(ex, conch=1.2)
+    narrow_state = cb.make_state(ex, conck=12)
     narrow = cb.sky_callback(ex, narrow_state, env, cb.sample_info(ex, narrow_state))
     assert np.array(narrow.data[0].z, dtype=float).shape != z.shape      # a finer cell
     off = cb.sky_callback(ex, cb.make_state(ex, density=[]), env, sample)
@@ -232,7 +284,7 @@ def test_app_layout_and_http_callback(conc_explorer, conc_stores):
     app = create_app(ex)
     ids = {c.id for c in app.layout._traverse() if getattr(c, "id", None)}
     assert {"conc-summary", "conc-table", "conc-caption", "f-concregion", "conc-weight",
-            "conc-bw", "conc-step", "conc-prom", "model-table", "sky-pick", "btn-pick-all",
+            "conc-k", "conc-step", "conc-prom", "conc-floor", "model-table", "sky-pick", "btn-pick-all",
             "btn-pick-none", "btn-clear-paths", "btn-run-model", "btn-clear-model", "pick-info",
             "model-status", "store-struct", "store-model"} <= ids
     assert "conc-table.children" in " ".join(app.callback_map)
@@ -268,6 +320,10 @@ def test_app_layout_and_http_callback(conc_explorer, conc_stores):
     figure = resp.get_json()["response"]["sky-fig"]["figure"]
     assert [t["name"] for t in figure["data"]] == SKY_TRACES
     assert figure["layout"]["dragmode"] == "drawopenpath"
+    # in the drawing mode the ridges that are on are editable shapes named 'ridge <id>'
+    shapes = figure["layout"]["shapes"]
+    assert [s["name"] for s in shapes] == ["ridge 1"] and shapes[0]["editable"] is True
+    assert shapes[0]["type"] == "path" and shapes[0]["path"].startswith("M")
 
 
 def test_a_sample_without_ridges_still_gives_a_panel_and_a_figure(conc_explorer, conc_stores):
@@ -275,12 +331,13 @@ def test_a_sample_without_ridges_still_gives_a_panel_and_a_figure(conc_explorer,
     state, _, env = conc_stores
     none = cb.sample_info(ex, cb.make_state(ex, concprom=1000.0))   # only the global maximum
     lines, table, caption = cb.concentration_callback(ex, env, none)
-    assert any("Peaks: 1 significant" in line and "ridges: 0" in line for line in lines)
+    assert any("Peaks: 1 significant" in line and "ridges (floor 1 sigma, 1 peaks above it)" in line
+               for line in lines)
     rows = [[c.children for c in tr.children] for tr in table.children[1].children]
     assert int(rows[0][6]) + int(rows[0][3]) == int(ex.select(none["filters"]).sum())
     sky = cb.sky_callback(ex, state, env, none)
     assert [t.name for t in sky.data] == SKY_TRACES
-    assert list(sky.data[7].x) == [] and list(sky.data[8].x) == []
+    assert list(sky.data[6].x) == [] and list(sky.data[7].x) == []
     assert len(sky.data[PEAKS].x) == 1 and len(sky.layout.annotations) == 1
 
 
@@ -288,7 +345,7 @@ def test_live_recompute_is_fast_and_cached(conc_explorer, conc_stores):
     import time
     ex = conc_explorer
     state, sample, env = conc_stores
-    sample = cb.sample_info(ex, cb.make_state(ex, conch=1.2))
+    sample = cb.sample_info(ex, cb.make_state(ex, conck=12))
     t0 = time.perf_counter()
     cb.concentration_result(ex, sample)
     first = time.perf_counter() - t0
@@ -393,6 +450,12 @@ def drawn(path):
     return {"type": "path", "path": path, "editable": True, "xref": "x", "yref": "y"}
 
 
+def named(kind, ident, path="M181.0,2.0L181.5,2.5"):
+    """The shape of a ridge or drawn path that the figure put in layout.shapes (plotly keeps its
+    name); its geometry is not read back."""
+    return {**drawn(path), "name": f"{kind} {ident}"}
+
+
 @pytest.fixture(scope="module")
 def picked(conc_explorer, conc_stores):
     """(explorer, sample, env, state, struct at start, map result) of the default sample."""
@@ -423,7 +486,8 @@ def test_map_key_follows_the_map_and_not_the_region(conc_explorer, conc_stores):
     assert re.fullmatch(r"[0-9a-f]{12}", sample["map_key"]) and sample["map_key"] == cb.map_key(sample)
     inside = cb.sample_info(ex, cb.make_state(ex, concregion="inside"))
     assert inside["map_key"] == sample["map_key"]                       # the region is not the map
-    assert cb.sample_info(ex, cb.make_state(ex, conch=1.5))["map_key"] != sample["map_key"]
+    assert cb.sample_info(ex, cb.make_state(ex, conck=12))["map_key"] != sample["map_key"]
+    assert cb.sample_info(ex, cb.make_state(ex, concfloor=3.0))["map_key"] != sample["map_key"]
     assert cb.sample_info(ex, cb.make_state(ex, z_types=["spec"]))["map_key"] != sample["map_key"]
 
 
@@ -471,8 +535,9 @@ def test_struct_update_stores_a_drawn_path_once(picked):
     assert s2["paths"][1]["ra"] == [181.0, 180.5]
     # only in 'paths' mode; an edited shape or an event without shapes changes nothing
     assert cb.struct_update(ex, s0, sample, ["peaks"], "relayout", relayout=event) == s0
-    assert cb.struct_update(ex, s1, sample, ["paths"], "relayout",
-                            relayout={"shapes[0].path": "M1,1L2,2"}) == s1
+    edit = cb.struct_update(ex, s1, sample, ["paths"], "relayout",
+                            relayout={"shapes[0].path": "M1,1L2,2"})
+    assert {**edit, "rev": 0} == {**s1, "rev": 0} and edit["rev"] == s1["rev"] + 1   # put back
     assert cb.struct_update(ex, s1, sample, ["paths"], "relayout",
                             relayout={"xaxis.range[0]": 1.0}) == s1
     # one point, a repeated point, a command that is not supported, text that is no path
@@ -495,7 +560,7 @@ def test_struct_update_stores_a_drawn_path_once(picked):
 def test_struct_update_all_none_clear_and_a_new_map(picked):
     ex, sample, _, _, s0, result = picked
     s = cb.struct_update(ex, s0, sample, ["paths"], "relayout", relayout={"shapes": [
-        drawn("M181.5,2.0L181.2,2.2"), drawn("M181.0,1.0L180.5,1.5")]})
+        named("ridge", 1), drawn("M181.5,2.0L181.2,2.2"), drawn("M181.0,1.0L180.5,1.5")]})
     none = cb.struct_update(ex, s, sample, [], "none")
     assert none["off_peaks"] == [1, 2] and none["off_ridges"] == [1]
     assert [q["on"] for q in none["paths"]] == [False, False]
@@ -504,7 +569,7 @@ def test_struct_update_all_none_clear_and_a_new_map(picked):
     cleared = cb.struct_update(ex, none, sample, [], "clear_paths")
     assert cleared["paths"] == [] and cleared["off_peaks"] == [1, 2] and cleared["next_id"] == 3
     # another map: the ids belong to the old map, the drawn paths stay
-    other = cb.sample_info(ex, cb.make_state(ex, conch=1.5))
+    other = cb.sample_info(ex, cb.make_state(ex, conck=12))
     moved = cb.struct_update(ex, none, other, [], "sample")
     assert moved["map_key"] == other["map_key"] != none["map_key"]
     assert moved["off_peaks"] == [] and moved["off_ridges"] == [] and moved["paths"] == none["paths"]
@@ -515,7 +580,7 @@ def test_struct_update_all_none_clear_and_a_new_map(picked):
 
 def test_pick_counts_and_run_spec_take_the_structures_that_are_on(picked):
     ex, sample, _, _, s0, result = picked
-    assert cb.pick_counts(ex, sample, s0) == "peaks on 2/2, ridges on 1/1, drawn 0"
+    assert cb.pick_counts(ex, sample, s0) == "peaks on 2/2, ridges on 1/1, drawn 0, added peaks 0"
     spec = cb.run_spec(ex, sample, s0)                      # all on: the default spec of the map
     ref = default_spec(result)
     np.testing.assert_allclose(spec["peaks"], ref["peaks"])
@@ -526,11 +591,11 @@ def test_pick_counts_and_run_spec_take_the_structures_that_are_on(picked):
     assert spec["paths"][0]["ra"] == ridge_table(result)[0]["ra"]
     # some off, one drawn path on and one off
     s = cb.struct_update(ex, s0, sample, ["paths"], "relayout", relayout={"shapes": [
-        drawn("M181.5,2.0L181.2,2.2"), drawn("M181.0,1.0L180.5,1.5")]})
+        named("ridge", 1), drawn("M181.5,2.0L181.2,2.2"), drawn("M181.0,1.0L180.5,1.5")]})
     s = cb.struct_update(ex, s, sample, ["peaks", "paths"], "click", click("path", 2))
     s = cb.struct_update(ex, s, sample, ["peaks"], "click", click("peak", 1))
     s = cb.struct_update(ex, s, sample, ["peaks"], "click", click("ridge", 1))
-    assert cb.pick_counts(ex, sample, s) == "peaks on 1/2, ridges on 0/1, drawn 1/2"
+    assert cb.pick_counts(ex, sample, s) == "peaks on 1/2, ridges on 0/1, drawn 1/2, added peaks 0"
     spec = cb.run_spec(ex, sample, s)
     assert spec["peaks"] == [[peak_table(result)[1]["ra"], peak_table(result)[1]["dec"]]]
     assert spec["paths"] == [{"label": "drawn 1", "ra": [181.5, 181.2], "dec": [2.0, 2.2]}]
@@ -592,24 +657,26 @@ def test_model_drives_the_sample_filter_the_table_and_the_overlay(picked):
     assert "Inside = within the 1σ band of the model (2 peaks, 1 paths)" in caption
     assert lines[0].startswith("Map of ") and lines[4].startswith("Model: 2 peaks and 1 paths")
     assert any(line.startswith("Inside the 1 sigma band of the model: ") for line in lines)
-    assert any(line.startswith("ridge 1: ") for line in lines)
+    assert any(line.startswith("ridge 1: ") and "intrinsic" not in line for line in lines)
+    assert not any("intrinsic" in line for line in lines)
     # the structures table: one row per peak and path, N inside the band of each
     box = cb.structures_table(ex, plain)
     assert box.children[1].className == "conc-table"
     srows = [[c.children for c in tr.children] for tr in box.children[1].children[1].children]
     assert [c.children for c in box.children[1].children[0].children.children] == list(STRUCTURE_HEADER)
     assert [r[:2] for r in srows] == [["peak 1", "peak"], ["peak 2", "peak"], ["ridge 1", "path"]]
-    assert sum(int(r[7]) for r in srows) == int((base & columns["model_inside"]).sum())
-    assert float(srows[0][2]) > 0 and " / " in srows[2][4] and srows[0][5] == "-"
+    assert sum(int(r[6]) for r in srows) == int((base & columns["model_inside"]).sum())
+    assert float(srows[0][2]) > 0 and " / " in srows[2][3] and srows[0][4] == "-"
+    assert "intrinsic s [Mpc]" not in STRUCTURE_HEADER and len(STRUCTURE_HEADER) == 7
     # a sky selection restricts the counts of the structures, as it does the table
     some = list(np.flatnonzero(base & columns["model_inside"])[:5])
     few = cb.structures_table(ex, plain, some).children[1].children[1].children
-    assert sum(int(tr.children[7].children) for tr in few) == 5
+    assert sum(int(tr.children[6].children) for tr in few) == 5
     assert cb.structures_table(ex, sample).children is None                  # no model: empty Div
     # the overlay: the fitted paths, the 1 sigma band and the circles of the peaks
     sky = cb.sky_callback(ex, state, env, plain, struct=s0, pick=[])
-    assert [t.name for t in sky.data] == SKY_TRACES[:13] + MODEL_TRACES + SKY_TRACES[13:]
-    band, circles, fitted = sky.data[13], sky.data[14], sky.data[15]
+    assert [t.name for t in sky.data] == SKY_TRACES[:11] + MODEL_TRACES + SKY_TRACES[11:]
+    band, circles, fitted = sky.data[11], sky.data[12], sky.data[13]
     assert fitted.line.color == band.line.color == circles.line.color == figures.MODEL
     assert (fitted.line.width, band.line.width, band.line.dash) == (3.0, 1.0, "dash")
     assert circles.line.width == 1.5 and circles.showlegend is False
@@ -649,7 +716,7 @@ def test_sky_figure_pick_modes_and_the_state_of_the_structures(picked):
     base = cb.sky_callback(ex, state, env, sample)
     assert base.layout.dragmode == "select" and base.layout.shapes == ()
     assert base.layout.newshape.line.color == figures.DRAWN and base.layout.newshape.line.width == 2
-    assert base.layout.editrevision == "sky0-0" and base.layout.uirevision == "sky0"
+    assert base.layout.editrevision == "sky0-0-view" and base.layout.uirevision == "sky0"
     galaxies = base.data[GALAXIES]
     assert galaxies.hoverinfo is None and "ridge" not in galaxies.hovertemplate
     assert base.data[0].hovertemplate.startswith("RA ") and base.data[0].hoverinfo is None
@@ -658,13 +725,23 @@ def test_sky_figure_pick_modes_and_the_state_of_the_structures(picked):
         fig = cb.sky_callback(ex, state, env, sample, struct=s0, pick=pick)
         assert fig.layout.dragmode == mode
         assert fig.data[GALAXIES].hoverinfo == "skip" and fig.data[GALAXIES].hovertemplate is None
-        assert fig.data[0].hoverinfo == "skip" and fig.data[0].hovertemplate is None
-        assert fig.data[7].hoverinfo is None and fig.data[PEAKS].hovertemplate == "%{text}<extra></extra>"
+        assert fig.data[0].hoverongaps is False                  # no click outside the survey
+        if "peaks" in pick:                                      # a click on the map adds a peak
+            assert fig.data[0].hovertemplate == figures.CLICK_HOVER and fig.data[0].hoverinfo is None
+        else:
+            assert fig.data[0].hoverinfo == "skip" and fig.data[0].hovertemplate is None
+        assert fig.data[PEAKS].hovertemplate == "%{text}<extra></extra>"
+        if "paths" in pick:      # ridges that are on are editable shapes, their traces are empty
+            assert list(fig.data[6].x) == [] and list(fig.data[7].x) == []
+            assert [s.name for s in fig.layout.shapes] == ["ridge 1"]
+        else:
+            assert fig.data[6].hoverinfo is None and len(fig.data[6].x) + len(fig.data[7].x) > 5
+            assert fig.layout.shapes == ()
     # everything on: peaks white, the ridge cyan with customdata [kind, id] on every vertex
     notes = base.layout.annotations
     assert [n.name for n in notes] == ["peak 1", "peak 2"] and all(n.captureevents for n in notes)
     assert all(n.font.color == figures.PEAK and n.font.size == 22 for n in notes)
-    ridges = base.data[7]
+    ridges = next(t for t in base.data if t.name in ("ridges", "ridges to the border") and len(t.x))
     cd = [list(c) for c in ridges.customdata]
     assert cd[:-1] == [["ridge", 1]] * (len(cd) - 1) and cd[-1] == [None, None]
     assert ridges.mode == "lines+markers" and ridges.hovertemplate == "%{text}<extra></extra>"
@@ -673,12 +750,12 @@ def test_sky_figure_pick_modes_and_the_state_of_the_structures(picked):
     assert list(base.data[PEAKS].marker.color) == [figures.PEAK, figures.PEAK]
     # switched off: grey and smaller stars, the ridge moves to 'ridges off', drawn paths show
     s = cb.struct_update(ex, s0, sample, ["paths"], "relayout", relayout={"shapes": [
-        drawn("M181.5,2.0L181.2,2.2"), drawn("M181.0,1.0L180.5,1.5")]})
+        named("ridge", 1), drawn("M181.5,2.0L181.2,2.2"), drawn("M181.0,1.0L180.5,1.5")]})
     s = cb.struct_update(ex, s, sample, ["peaks"], "click", click("peak", 1))
     s = cb.struct_update(ex, s, sample, ["peaks"], "click", click("ridge", 1))
     s = cb.struct_update(ex, s, sample, ["paths"], "click", click("path", 2))
-    fig = cb.sky_callback(ex, state, env, sample, clear_clicks=2, struct=s, pick=["peaks", "paths"])
-    assert fig.layout.editrevision == f"sky2-{s['rev']}" and fig.layout.uirevision == "sky2"
+    fig = cb.sky_callback(ex, state, env, sample, clear_clicks=2, struct=s, pick=["peaks"])
+    assert fig.layout.editrevision == f"sky2-{s['rev']}-view" and fig.layout.uirevision == "sky2"
     off_note, on_note = fig.layout.annotations
     assert (off_note.font.color, off_note.font.size, off_note.name) == (figures.OFF, 16, "peak 1")
     assert (on_note.font.color, on_note.font.size, on_note.name) == (figures.PEAK, 22, "peak 2")
@@ -697,19 +774,300 @@ def test_sky_figure_pick_modes_and_the_state_of_the_structures(picked):
     assert list(path_on.x)[:2] == [181.5, 181.2] and path_on.text[0] == "drawn path 1 (on)"
     assert path_off.line.color == figures.OFF and path_off.line.dash == "dot"
     assert [list(c) for c in path_off.customdata][0] == ["path", 2]
-    # a ridge whose saddle is below 1 sigma is thin and dotted, one that reaches the border dashed
+    # in the drawing mode only what is on is an editable shape: the drawn path 1, not the ridge
+    # that is off nor the drawn path 2; the traces of what is on are empty, the others stay
+    draw = cb.sky_callback(ex, state, env, sample, clear_clicks=2, struct=s, pick=["paths"])
+    assert draw.layout.editrevision == f"sky2-{s['rev']}-draw"
+    assert [sh.name for sh in draw.layout.shapes] == ["path 1"]
+    shape = draw.layout.shapes[0]
+    assert shape.type == "path" and shape.editable is True and shape.line.color == figures.DRAWN
+    assert cb.parse_svg_path(shape.path) == ([181.5, 181.2], [2.0, 2.2])
+    drawn_names = {t.name: t for t in draw.data}
+    assert len(drawn_names["drawn paths"].x) == 0 and len(drawn_names["drawn paths off"].x) > 0
+    assert len(drawn_names["ridges off"].x) > 0
+    # the ridge shapes are the ridges that are on: cyan, dashed when they run to the border
+    on = cb.sky_callback(ex, state, env, sample, struct=s0, pick=["paths"]).layout.shapes
+    assert [sh.name for sh in on] == ["ridge 1"] and on[0].line.color == figures.RIDGE
+    ridge = ridge_table(cb.concentration_result(ex, sample)[1])[0]
+    assert cb.parse_svg_path(on[0].path)[0] == pytest.approx(ridge["ra"], abs=1e-4)
+    assert cb.parse_svg_path(on[0].path)[1] == pytest.approx(ridge["dec"], abs=1e-4)
+    # the overlay groups: no low-crest group, the shapes of what is on
     overlay = cb.concentration_overlay(ex, sample, s0)
-    assert set(overlay["ridge_groups"]) == {"strong", "open", "low", "off"}
-    assert len(overlay["ridge_groups"]["strong"]["x"]) > 0 and not overlay["ridge_groups"]["low"]["x"]
+    assert set(overlay["ridge_groups"]) == {"strong", "open", "off"}
+    assert not any(t.name == "low-crest ridges" for t in base.data)
+    assert "low-crest ridges" not in [n for n, *_ in figures.RIDGE_STYLES]
+    assert [sh["name"] for sh in overlay["shapes"]] == ["ridge 1"]
+    assert len(overlay["ridge_groups"]["strong"]["x"]) + len(overlay["ridge_groups"]["open"]["x"]) > 0
     assert overlay["peak_id"] == [1, 2] and overlay["peak_on"] == [True, True] and overlay["model"] is None
-    low = {k: v for k, v in overlay.items()}
-    strong = overlay["ridge_groups"]["strong"]
-    low["ridge_groups"] = {**overlay["ridge_groups"], "strong": overlay["ridge_groups"]["low"],
-                           "low": strong}
-    swapped = figures.sky_figure(cb.build_view(ex, state, env, sample), overlay=low)
-    thin = next(t for t in swapped.data if t.name == "low-crest ridges")
-    assert thin.line.width == 2.0 and thin.line.dash == "dot" and thin.line.color == figures.RIDGE
-    assert next(t for t in swapped.data if t.name == "ridges to the border").line.dash == "dash"
+    assert overlay["user_peak_id"] == []
+
+
+def heat_click(ra=181.2, dec=2.1, z=1.5):
+    """A Graph's clickData on a cell of the map heatmap: no customdata, x y z of the cell."""
+    return {"points": [{"curveNumber": 0, "pointNumber": [3, 4], "pointIndex": [3, 4],
+                        "x": ra, "y": dec, "z": z}]}
+
+
+def test_a_click_on_the_map_adds_a_peak_and_a_click_on_its_star_removes_it(picked):
+    ex, sample, _, _, s0, result = picked
+    # only in the 'peaks' mode: a click on the map does nothing while drawing or with no mode
+    for pick in ([], ["paths"]):
+        assert cb.struct_update(ex, s0, sample, pick, "click", heat_click()) == s0
+    s1 = cb.struct_update(ex, s0, sample, ["peaks"], "click", heat_click(181.2, 2.1))
+    assert s1["user_peaks"] == [{"id": 1, "ra": 181.2, "dec": 2.1}] and s1["next_id"] == 2
+    assert s0["user_peaks"] == [] and s0["next_id"] == 1                  # the input is kept
+    assert s1["off_peaks"] == [] and s1["off_ridges"] == [] and s1["paths"] == []
+    s2 = cb.struct_update(ex, s1, sample, ["peaks", "paths"], "click", heat_click(180.9, 1.8))
+    assert [(q["id"], q["ra"], q["dec"]) for q in s2["user_peaks"]] == [
+        (1, 181.2, 2.1), (2, 180.9, 1.8)] and s2["next_id"] == 3
+    # the ids come from next_id, shared with the drawn paths
+    s3 = cb.struct_update(ex, s2, sample, ["paths"], "relayout", relayout={"shapes": [
+        named("ridge", 1), drawn("M181.5,2.0L181.2,2.2")]})
+    assert s3["paths"][0]["id"] == 3 and s3["next_id"] == 4
+    # a cell with no value (outside the survey), no position, or a galaxy is not a map click
+    for bad in ({"points": [{"x": 181.2, "y": 2.1, "z": None}]},
+                {"points": [{"x": 181.2, "y": 2.1, "z": float("nan")}]},
+                {"points": [{"x": 181.2, "z": 1.0}]}, {"points": [{"x": "a", "y": 2.1, "z": 1.0}]},
+                {"points": [{"customdata": [12.0, 0.02, 9.1, 0.3, 181.0, 2.0], "x": 181.2,
+                             "y": 2.1}]}, {"points": []}, None):
+        assert cb.struct_update(ex, s0, sample, ["peaks"], "click", bad) == s0
+    # a ridge, path or peak vertex under the cursor wins over the map cell of the same click
+    both = {"points": [{**heat_click()["points"][0], "customdata": ["ridge", 1]}]}
+    on_ridge = cb.struct_update(ex, s0, sample, ["peaks"], "click", both)
+    assert on_ridge["off_ridges"] == [1] and on_ridge["user_peaks"] == []
+    # the star of a peak added by hand (annotation 'user peak <id>') removes it, in 'peaks' mode
+    note = {"event": {}, "fullAnnotation": {"name": "user peak 1", "text": "★"}, "timestamp": 1}
+    s4 = cb.struct_update(ex, s2, sample, ["peaks"], "annotation", note)
+    assert [q["id"] for q in s4["user_peaks"]] == [2] and s4["off_peaks"] == []
+    assert cb.struct_update(ex, s2, sample, ["paths"], "annotation", note) == s2
+    assert cb.struct_update(ex, s2, sample, ["peaks"], "annotation",
+                            {"fullAnnotation": {"name": "user peak 9"}}) == s2
+    # the star of an automatic peak 1 is another thing, though the number is the same
+    auto = cb.struct_update(ex, s2, sample, ["peaks"], "annotation",
+                            {"fullAnnotation": {"name": "peak 1"}})
+    assert auto["off_peaks"] == [1] and auto["user_peaks"] == s2["user_peaks"]
+    # a click event on a user peak vertex (customdata [kind, id]) removes it as well
+    gone = cb.struct_update(ex, s2, sample, ["peaks"], "click", click("user_peak", 2))
+    assert [q["id"] for q in gone["user_peaks"]] == [1]
+    assert cb.struct_update(ex, s2, sample, ["paths"], "click", click("user_peak", 2)) == s2
+    # All on / All off leave them, Clear drawn removes them with the drawn paths
+    assert cb.struct_update(ex, s3, sample, [], "none")["user_peaks"] == s3["user_peaks"]
+    assert cb.struct_update(ex, s3, sample, [], "all")["user_peaks"] == s3["user_peaks"]
+    cleared = cb.struct_update(ex, s3, sample, [], "clear_paths")
+    assert cleared["paths"] == [] and cleared["user_peaks"] == [] and cleared["next_id"] == 4
+    # another map: the peaks added by hand go with the old one
+    other = cb.sample_info(ex, cb.make_state(ex, conck=12))
+    moved = cb.struct_update(ex, s3, other, [], "sample")
+    assert moved["user_peaks"] == [] and moved["paths"] == s3["paths"]
+    # a sample too small for a map keeps the struct and adds nothing
+    assert cb.struct_update(ex, s0, None, ["peaks"], "click", heat_click()) == s0
+    # an old store-struct without the key is read as empty
+    legacy = {k: v for k, v in s0.items() if k != "user_peaks"}
+    assert cb.struct_update(ex, legacy, sample, ["peaks"], "click", heat_click())["user_peaks"] == [
+        {"id": 1, "ra": 181.2, "dec": 2.1}]
+
+
+def test_the_peaks_added_by_hand_are_drawn_counted_and_run_with_the_model(picked):
+    ex, sample, env, state, s0, result = picked
+    peak = peak_table(result)[1]
+    ra, dec = peak["ra"] + 0.05, peak["dec"] - 0.04                    # a little off peak 2
+    s = cb.struct_update(ex, s0, sample, ["peaks"], "click", heat_click(ra, dec))
+    s = cb.struct_update(ex, s, sample, ["peaks"], "click", heat_click(181.9, 2.9))
+    assert cb.pick_counts(ex, sample, s) == "peaks on 2/2, ridges on 1/1, drawn 0, added peaks 2"
+    # the figure: magenta stars as annotations (clicks reach Dash) and a legend entry
+    fig = cb.sky_callback(ex, state, env, sample, struct=s, pick=["peaks"])
+    notes = fig.layout.annotations
+    assert [n.name for n in notes] == ["peak 1", "peak 2", "user peak 1", "user peak 2"]
+    mine = notes[2]
+    assert (mine.x, mine.y, mine.text) == (ra, dec, "★") and mine.captureevents is True
+    assert mine.font.color == figures.DRAWN != notes[0].font.color and mine.font.size >= 20
+    trace = next(t for t in fig.data if t.name == "peaks added by hand")
+    assert list(trace.x) == [ra, 181.9] and [list(c) for c in trace.customdata] == [
+        ["user_peak", 1], ["user_peak", 2]]
+    assert not any(t.name == "peaks added by hand" for t in cb.sky_callback(ex, state, env, sample,
+                                                                            struct=s0).data)
+    assert [t.name for t in fig.data] == SKY_TRACES[:12] + ["peaks added by hand"] + SKY_TRACES[12:]
+    # the model takes them like the automatic peaks that are on, after them
+    spec = cb.run_spec(ex, sample, s)
+    assert len(spec["peaks"]) == 4 and spec["peaks"][2:] == [[ra, dec], [181.9, 2.9]]
+    off = cb.struct_update(ex, s, sample, ["peaks"], "click", click("peak", 1))
+    assert len(cb.run_spec(ex, sample, off)["peaks"]) == 3
+    stale = {**s, "map_key": "0123456789ab"}                     # the peaks belong to their map
+    assert len(cb.run_spec(ex, sample, stale)["peaks"]) == 2
+    spec, status = cb.run_model(ex, sample, s)
+    assert status == f"model: 4 peaks, 1 paths (run {spec['time']})"
+    columns, model = cb.model_result(ex, {**sample, "model": spec})
+    h = cb.concentration_result(ex, sample)[1]["info"]["knn_scale_mpc"]
+    assert [p["label"] for p in model["peaks"]] == ["peak 1", "peak 2", "peak 3", "peak 4"]
+    # refined to the highest cell within PEAK_SEARCH h of the click, which is near peak 2's top
+    assert model["peaks"][2]["shift_mpc"] <= 1.0 * h + result["grid"]["pixel"]
+    assert np.hypot(model["peaks"][2]["x"] - model["peaks"][1]["x"],
+                    model["peaks"][2]["y"] - model["peaks"][1]["y"]) < 2.0 * h
+    assert model["info"]["n_peaks"] == 4 and model["skipped"] == []
+
+
+def test_erasing_a_named_shape_switches_the_structure_off_and_a_new_shape_adds_a_path(picked):
+    ex, sample, env, state, s0, _ = picked
+    kept = cb.struct_update(ex, s0, sample, ["paths"], "relayout",
+                            relayout={"shapes": [named("ridge", 1)]})
+    assert {**kept, "rev": 0} == {**s0, "rev": 0} and kept["off_ridges"] == []
+    # the modebar eraser: the remaining shapes, the ridge is not among them
+    erased = cb.struct_update(ex, s0, sample, ["paths"], "relayout",
+                              relayout={"shapes": [], "_deactivateShape": True})
+    assert erased["off_ridges"] == [1] and erased["paths"] == [] and erased["rev"] == 1
+    assert s0["off_ridges"] == []
+    assert cb.struct_update(ex, erased, sample, ["paths"], "relayout",
+                            relayout={"shapes": []})["off_ridges"] == [1]            # once
+    # a click in the 'peaks' mode switches it on again; peaks and drawn paths are untouched
+    back = cb.struct_update(ex, erased, sample, ["peaks"], "click", click("ridge", 1))
+    assert back["off_ridges"] == [] and erased["off_peaks"] == [] == back["off_peaks"]
+    # only in the drawing mode (that is where the shapes are)
+    assert cb.struct_update(ex, s0, sample, ["peaks"], "relayout", relayout={"shapes": []}) == s0
+    assert cb.struct_update(ex, s0, sample, [], "relayout", relayout={"shapes": []}) == s0
+    # a drawn path, then the ridge and the path both shown as named shapes
+    path = "M181.5,2.0L181.2,2.2L180.9,2.4"
+    one = cb.struct_update(ex, s0, sample, ["paths"], "relayout",
+                           relayout={"shapes": [named("ridge", 1), drawn(path)]})
+    assert [q["id"] for q in one["paths"]] == [1] and one["off_ridges"] == []
+    both = {"shapes": [named("ridge", 1), named("path", 1)]}
+    same = cb.struct_update(ex, one, sample, ["paths"], "relayout", relayout=both)
+    assert same["paths"] == one["paths"] and same["off_ridges"] == [] and same["next_id"] == 2
+    # a new unnamed shape among the named ones is a new drawn path
+    new = cb.struct_update(ex, one, sample, ["paths"], "relayout", relayout={"shapes": [
+        named("ridge", 1), named("path", 1), drawn("M181.0,1.0L180.5,1.5")]})
+    assert [q["id"] for q in new["paths"]] == [1, 2] and new["paths"][1]["ra"] == [181.0, 180.5]
+    assert new["paths"][0]["on"] and new["off_ridges"] == [] and new["next_id"] == 3
+    # a named path shape that is gone: the path is switched off, not deleted; the ridge stays on
+    gone = cb.struct_update(ex, new, sample, ["paths"], "relayout",
+                            relayout={"shapes": [named("ridge", 1), named("path", 2)]})
+    assert [(q["id"], q["on"]) for q in gone["paths"]] == [(1, False), (2, True)]
+    assert gone["off_ridges"] == []
+    # ... and a click on it in the 'peaks' mode switches it on again
+    assert cb.struct_update(ex, gone, sample, ["peaks"], "click", click("path", 1))["paths"][0]["on"]
+    # a path that is already off has no shape and is not erased again
+    again = cb.struct_update(ex, gone, sample, ["paths"], "relayout",
+                             relayout={"shapes": [named("ridge", 1), named("path", 2)]})
+    assert [(q["id"], q["on"]) for q in again["paths"]] == [(1, False), (2, True)]
+    # a browser that still holds the unnamed shape of a stored path keeps that path on
+    stale = cb.struct_update(ex, one, sample, ["paths"], "relayout",
+                             relayout={"shapes": [named("ridge", 1), drawn(path)]})
+    assert stale["paths"][0]["on"] is True and len(stale["paths"]) == 1
+    # shapes of other ids and names that are not ours are ignored
+    odd = cb.struct_update(ex, s0, sample, ["paths"], "relayout", relayout={"shapes": [
+        named("ridge", 1), named("ridge", 99), {**drawn("M1,1L2,2"), "name": "label"},
+        {"type": "rect", "name": "path x"}, "text", None]})
+    assert odd["off_ridges"] == [] and odd["paths"] == [] and odd["next_id"] == 1
+    # edits of a named shape (plotly: 'shapes[i].path', 'shapes[i].x0', ...) never touch the
+    # structures; only 'rev' moves so that the figure puts the shape back
+    for key in ("shapes[0].path", "shapes[1].x0", "shapes[12].y1"):
+        edit = cb.struct_update(ex, one, sample, ["paths"], "relayout", relayout={key: "M9,9L8,8"})
+        assert {**edit, "rev": 0} == {**one, "rev": 0} and edit["rev"] == one["rev"] + 1
+    for harmless in ({"xaxis.range[0]": 1.0}, {"shapesx": 1}, {}, None, "text", {"shapes": "no"}):
+        assert cb.struct_update(ex, one, sample, ["paths"], "relayout", relayout=harmless) == one
+    # the figure then shows what is left: the erased ridge is a trace 'ridges off', not a shape
+    fig = cb.sky_callback(ex, state, env, sample, struct=erased, pick=["paths"])
+    assert fig.layout.shapes == () and fig.layout.editrevision == "sky0-1-draw"
+    assert len(next(t for t in fig.data if t.name == "ridges off").x) > 0
+
+
+def test_the_colour_scale_is_log_with_a_floor_and_clicks_do_not_depend_on_z(picked):
+    ex, sample, env, state, s0, _ = picked
+    z = np.array([[np.nan, 0.0, 0.05, 0.1], [0.5, 1.0, 12.0, 400.0]])
+    logz, zmax, ticks, labels = figures.map_scale(z)
+    assert np.isnan(logz[0, 0]) and logz[0, 1] == logz[0, 2] == logz[0, 3] == -1.0
+    assert np.isfinite(logz[~np.isnan(z)]).all()                       # empty cells stay finite
+    assert logz[1, 1] == 0.0 and logz[1, 2] == pytest.approx(np.log10(12.0))
+    assert zmax == pytest.approx(np.log10(np.percentile([0.0, 0.05, 0.1, 0.5, 1.0, 12.0, 400.0],
+                                                        99.5)))
+    assert labels == ["0.1", "0.3", "1", "3", "10", "30", "100"] and ticks[2] == 0.0
+    # a map that never reaches the mean: the top is the mean, the ticks stop there
+    low = figures.map_scale(np.array([[0.2, 0.3], [np.nan, 0.5]]))
+    assert low[1] == 0.0 and low[3] == ["0.1", "0.3", "1"]
+    assert figures.map_scale(np.full((2, 2), np.nan))[1] == 0.0
+    # a click on a cell of the floor (z = -1, an empty cell inside the survey) adds a peak
+    for value in (-1.0, 0.0, 0.7, 1.9):
+        got = cb.struct_update(ex, s0, sample, ["peaks"], "click", heat_click(181.2, 2.1, value))
+        assert got["user_peaks"] == [{"id": 1, "ra": 181.2, "dec": 2.1}]
+    # the figure in the peaks mode: the same map, no linear customdata (the hover is the click text)
+    fig = cb.sky_callback(ex, state, env, sample, struct=s0, pick=["peaks"])
+    assert fig.data[0].customdata is None and fig.data[0].zmin == -1.0
+    off = cb.sky_callback(ex, cb.make_state(ex, density=[]), env, sample, struct=s0, pick=["peaks"])
+    np.testing.assert_array_equal(np.array(off.data[0].z, dtype=float),
+                                  np.array(fig.data[0].z, dtype=float))
+
+
+def test_the_map_answers_clicks_in_the_peaks_mode_with_or_without_the_density(picked):
+    ex, sample, env, state, s0, _ = picked
+    on = cb.sky_callback(ex, state, env, sample, struct=s0, pick=["peaks"])
+    heat = on.data[0]
+    assert heat.name == "concentration" and heat.hovertemplate == figures.CLICK_HOVER
+    assert heat.hoverongaps is False and heat.hoverinfo is None
+    assert "click" in heat.hovertemplate and "add peak" in heat.hovertemplate
+    assert [t.name for t in on.data] == SKY_TRACES
+    # the density background off: a fully transparent heatmap on the same grid takes its place
+    off_state = cb.make_state(ex, density=[])
+    off = cb.sky_callback(ex, off_state, env, sample, struct=s0, pick=["peaks"])
+    catcher = off.data[0]
+    assert type(catcher).__name__ == "Heatmap" and catcher.name == "click map"
+    assert catcher.showlegend is False and catcher.showscale is False and catcher.hoverongaps is False
+    assert catcher.hovertemplate == figures.CLICK_HOVER
+    assert all(c[1] == "rgba(0,0,0,0)" for c in catcher.colorscale)
+    np.testing.assert_array_equal(np.array(catcher.z, dtype=float), np.array(heat.z, dtype=float))
+    assert list(catcher.x) == list(heat.x) and list(catcher.y) == list(heat.y)
+    assert [t.name for t in off.data] == ["click map"] + SKY_TRACES[1:]
+    # no catcher without the mode, nor in the drawing mode alone; no heatmap then
+    for pick in ([], ["paths"]):
+        fig = cb.sky_callback(ex, off_state, env, sample, struct=s0, pick=pick)
+        assert [t.name for t in fig.data] == SKY_TRACES[1:]
+    # the structures stay above the map: stars are annotations and vertices have customdata
+    assert PICK_HINT.count("empty place") == 1 and "add a peak" in PICK_HINT
+    assert "eraser" in PICK_HINT and "Erase active shape" in PICK_HINT
+    assert "remove it" in PICK_HINT and "uncheck it to click" in PICK_HINT
+
+
+def test_user_peak_and_shape_events_over_http(conc_explorer, conc_stores):
+    ex = conc_explorer
+    app = create_app(ex)
+    state, sample, env = conc_stores
+    s0 = cb.struct_update(ex, None, sample, [], "sample")
+
+    def post(inputs, states, changed):
+        outputs = ["store-struct.data", "pick-info.children"]
+        out = [{"id": o.split(".")[0], "property": o.split(".", 1)[1]} for o in outputs]
+        payload = {"output": ".." + "...".join(outputs) + "..", "outputs": out,
+                   "inputs": [{"id": i, "property": p, "value": v} for i, p, v in inputs],
+                   "state": [{"id": i, "property": p, "value": v} for i, p, v in states],
+                   "changedPropIds": [changed]}
+        resp = app.server.test_client().post("/_dash-update-component", json=payload)
+        assert resp.status_code == 200, resp.data
+        return resp.get_json()["response"]
+
+    def inputs(click_data=None, annotation=None, relayout=None):
+        return [("sky-fig", "clickData", click_data), ("sky-fig", "clickAnnotationData", annotation),
+                ("sky-fig", "relayoutData", relayout), ("btn-pick-all", "n_clicks", 0),
+                ("btn-pick-none", "n_clicks", 0), ("btn-clear-paths", "n_clicks", 0),
+                ("store-sample", "data", sample)]
+
+    peaks_mode = [("sky-pick", "value", ["peaks"]), ("store-struct", "data", s0)]
+    body = post(inputs(click_data=heat_click(181.2, 2.1)), peaks_mode, "sky-fig.clickData")
+    added = body["store-struct"]["data"]
+    assert added["user_peaks"] == [{"id": 1, "ra": 181.2, "dec": 2.1}]
+    assert body["pick-info"]["children"].endswith("added peaks 1")
+    body = post(inputs(annotation={"fullAnnotation": {"name": "user peak 1"}}),
+                [("sky-pick", "value", ["peaks"]), ("store-struct", "data", added)],
+                "sky-fig.clickAnnotationData")
+    assert body["store-struct"]["data"]["user_peaks"] == []
+    # the eraser: the ridge shape is not in the remaining shapes
+    body = post(inputs(relayout={"shapes": [], "_deactivateShape": True}),
+                [("sky-pick", "value", ["paths"]), ("store-struct", "data", s0)],
+                "sky-fig.relayoutData")
+    assert body["store-struct"]["data"]["off_ridges"] == [1]
+    assert body["pick-info"]["children"].startswith("peaks on 2/2, ridges on 0/1")
+    # Clear drawn removes the added peaks too
+    body = post([*inputs()[:5], ("btn-clear-paths", "n_clicks", 1), ("store-sample", "data", sample)],
+                [("sky-pick", "value", ["peaks"]), ("store-struct", "data", added)],
+                "btn-clear-paths.n_clicks")
+    assert body["store-struct"]["data"]["user_peaks"] == []
 
 
 def test_struct_and_run_callbacks_over_http(conc_explorer, conc_stores):
@@ -736,13 +1094,13 @@ def test_struct_and_run_callbacks_over_http(conc_explorer, conc_stores):
     outputs = ["store-struct.data", "pick-info.children"]
     body = post(outputs, inputs, states, "sky-fig.clickData")
     assert body["store-struct"]["data"]["off_peaks"] == [1]
-    assert body["pick-info"]["children"] == "peaks on 1/2, ridges on 1/1, drawn 0"
+    assert body["pick-info"]["children"] == "peaks on 1/2, ridges on 1/1, drawn 0, added peaks 0"
     # a drawing becomes a stored path
     inputs[0] = ("sky-fig", "clickData", None)
     inputs[2] = ("sky-fig", "relayoutData", {"shapes": [drawn("M181.5,2.0L181.2,2.2")]})
     body = post(outputs, inputs, [("sky-pick", "value", ["paths"]), states[1]], "sky-fig.relayoutData")
     assert body["store-struct"]["data"]["paths"][0]["ra"] == [181.5, 181.2]
-    assert body["pick-info"]["children"].endswith("drawn 1")
+    assert body["pick-info"]["children"].endswith("drawn 1, added peaks 0")
     # an event that changes nothing leaves the outputs alone
     inputs[2] = ("sky-fig", "relayoutData", {"xaxis.range[0]": 1.0})
     assert post(outputs, inputs, [("sky-pick", "value", ["paths"]), states[1]],
@@ -803,7 +1161,7 @@ def test_snapshot_keeps_the_model_and_the_layout_has_the_controls(picked):
     assert "click a star, a ridge or a drawn path" in PICK_HINT and "uncheck it to click" in PICK_HINT
     assert [by_id[i].children for i in ("btn-pick-all", "btn-pick-none", "btn-clear-paths",
                                         "btn-run-model", "btn-clear-model")] == [
-        "All on", "All off", "Clear drawn paths", "Run model", "Clear model"]
+        "All on", "All off", "Clear drawn", "Run model", "Clear model"]
     assert by_id["model-status"].children == "model: not run"
     assert by_id["store-struct"].data == default_struct() and by_id["store-model"].data is None
     assert by_id["pick-controls"].style == {} and PICK_HINT in [

@@ -3,12 +3,11 @@ import pandas as pd
 import pytest
 
 from knn.app.figures import (PALETTE, clip_range, counts_text, empty_figure, graph_config,
-                             hist_figure, marker_sizes, scatter3d_figure, sky_figure,
-                             trend_figure, trend_matplotlib, trend_groups)
+                             hist_figure, marker_sizes, sky_figure, trend_figure, trend_matplotlib, trend_groups)
 from knn.explorer import trend_table
 
 
-def _view(n=300, seed=0, nan_color=0, size=False, selected=0):
+def _view(n=300, seed=0, nan_color=0, size=False):
     rng = np.random.default_rng(seed)
     d = pd.DataFrame({
         "row": np.arange(n), "id": [str(i) for i in range(n)],
@@ -16,12 +15,10 @@ def _view(n=300, seed=0, nan_color=0, size=False, selected=0):
         "z": rng.uniform(0.01, 0.03, n),
         "z_type": np.where(np.arange(n) % 4 == 0, "phot", "spec"),
         "logm": rng.normal(9, 1, n), "env": rng.normal(0, 1, n),
-        "cx": rng.normal(size=n), "cy": rng.normal(size=n), "cz": rng.normal(size=n),
         "color": rng.normal(size=n)})
     d.loc[:nan_color - 1, "color"] = np.nan
     if size:
         d["size"] = rng.uniform(0, 5, n)
-    d["selected"] = np.arange(n) < selected
     return d
 
 
@@ -60,26 +57,19 @@ def test_sky_figure_options():
     assert sky_figure(_view(), uirevision="sky3").layout.uirevision == "sky3"
 
 
-def test_scatter3d_figure_traces():
-    fig = scatter3d_figure(_view())
-    assert _types(fig) == ["Scatter3d", "Scatter3d"]
-    assert [t.name for t in fig.data] == ["spec-z", "photo-z"]
-    d = _view()
-    np.testing.assert_allclose(fig.data[0].x, d.loc[d.z_type == "spec", "ra"])
-    assert fig.layout.scene.xaxis.title.text == "RA [deg]"
-    xyz = scatter3d_figure(_view(selected=10), coords="xyz")
-    assert [t.name for t in xyz.data] == ["spec-z", "photo-z", "selection"]
-    d = _view(selected=10)
-    np.testing.assert_allclose(xyz.data[0].x, d.loc[d.z_type == "spec", "cx"])
-    assert xyz.layout.scene.xaxis.title.text == "x [Mpc]"
-    assert len(xyz.data[2].x) == 10
-    assert [t.name for t in scatter3d_figure(_view(nan_color=5)).data][-1] == "no value"
-    with pytest.raises(ValueError):
-        scatter3d_figure(_view(), coords="polar")
+def test_there_is_no_3d_figure():
+    import knn.app.figures as figures
+    assert not hasattr(figures, "scatter3d_figure")
+    assert "cx" not in figures.__doc__ and "selected" not in figures.__doc__
+
+
+def test_graph_config_adds_the_eraser_only_when_asked():
+    assert "modeBarButtonsToAdd" not in graph_config("png", "a")
+    assert graph_config("svg", "a", erase=True)["modeBarButtonsToAdd"] == ["eraseshape"]
 
 
 def test_empty_frames_give_an_annotated_figure():
-    for fig in (sky_figure(_view(0)), scatter3d_figure(_view(0)), trend_figure(
+    for fig in (sky_figure(_view(0)), trend_figure(
             trend_table([], [], None, None, None)), empty_figure("x")):
         assert len(fig.data) == 0 and len(fig.layout.annotations) == 1
 

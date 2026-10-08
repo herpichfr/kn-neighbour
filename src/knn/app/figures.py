@@ -1,12 +1,10 @@
 """Plotly and matplotlib figures of the explorer, as pure functions (data in, figure out).
 
-The view frame 'd' taken by sky_figure and scatter3d_figure is a DataFrame
-with one row per plotted galaxy and the columns
+The view frame 'd' taken by sky_figure is a DataFrame with one row per plotted galaxy and
+the columns
 
     row, id, ra, dec, z, z_type ('spec' | 'phot'), logm, env,
-    cx, cy, cz (comoving Mpc, for the 3D view),
-    color (float, NaN = no value), size (float, optional, NaN = smallest),
-    selected (bool, optional: highlighted in the 3D view)
+    color (float, NaN = no value), size (float, optional, NaN = smallest)
 
 Spec-z and photo-z galaxies are separate traces (circles / diamonds); rows
 whose colour is NaN go into a grey 'no value' trace; empty traces are omitted.
@@ -32,21 +30,32 @@ HALO = "rgba(8,8,24,0.8)"
 FONT = dict(family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif", size=12,
             color="#222")
 CONFIG_FORMATS = ("png", "svg")
-# ridge styles: (group key, trace name, colour, width, dash, opacity); the first three are the
+# ridge styles: (group key, trace name, colour, width, dash, opacity); the first two are the
 # switched-on ones (a halo is drawn under them), the last one is for the switched-off ridges
 RIDGE_STYLES = (("strong", "ridges", RIDGE, 3.5, "solid", 1.0),
                 ("open", "ridges to the border", RIDGE, 3.5, "dash", 1.0),
-                ("low", "low-crest ridges", RIDGE, 2.0, "dot", 1.0),
                 ("off", "ridges off", OFF, 1.5, "dot", 0.6))
+NO_LINES = {"x": [], "y": [], "customdata": [], "text": []}
+CLICK_HOVER = "click: add peak<extra></extra>"
+MAP_FLOOR = -1.0                      # lower bound of the colour scale: log10 of 0.1 x the mean
+MAP_TICKS = (0.1, 0.3, 1.0, 3.0, 10.0, 30.0, 100.0)
+CLEAR = [[0.0, "rgba(0,0,0,0)"], [1.0, "rgba(0,0,0,0)"]]
 
 
-def graph_config(fmt="png", name="knn"):
-    """dcc.Graph config: modebar image button saves PNG or SVG client side."""
+def graph_config(fmt="png", name="knn", erase=False):
+    """dcc.Graph config: modebar image button saves PNG or SVG client side.
+
+    erase: add the modebar button 'eraseshape' (Erase active shape), which removes the ridge or
+    drawn path that is active in the Select maximums mode of the sky map.
+    """
     if fmt not in CONFIG_FORMATS:
         raise ValueError(f"image format must be one of {CONFIG_FORMATS}")
-    return {"displaylogo": False, "responsive": True,
-            "toImageButtonOptions": {"format": fmt, "filename": name, "scale": 2},
-            "modeBarButtonsToRemove": ["sendDataToCloud"]}
+    config = {"displaylogo": False, "responsive": True,
+              "toImageButtonOptions": {"format": fmt, "filename": name, "scale": 2},
+              "modeBarButtonsToRemove": ["sendDataToCloud"]}
+    if erase:
+        config["modeBarButtonsToAdd"] = ["eraseshape"]
+    return config
 
 
 def clip_range(values, clip=(2.0, 98.0)):
@@ -144,21 +153,53 @@ def _structure_trace(group, name, colour, width, dash, opacity=1.0, legendgroup=
         legendgroup=legendgroup or name, showlegend=len(group["x"]) > 0)
 
 
-def _overlay_traces(fig, overlay, density, picking=False):
+def map_scale(z):
+    """(log z, zmax, tickvals, ticktext) of the map over its mean for the colour scale.
+
+    z: the map over its mean (NaN outside the survey, 0 or small for an empty cell). The colours
+    are log10(z) between MAP_FLOOR (z <= 0.1; the empty cells are set to it, so every cell inside
+    the survey keeps a finite value) and zmax = log10 of the 99.5th percentile of the finite cells
+    (at least z = 1). The ticks are the MAP_TICKS inside that range, labelled with z.
+    """
+    lin = np.asarray(z, dtype=float)
+    finite = lin[np.isfinite(lin)]
+    top = max(float(np.percentile(finite, 99.5)) if finite.size else 1.0, 1.0)
+    zmax = float(np.log10(top))
+    ticks = [t for t in MAP_TICKS if MAP_FLOOR - 1e-9 <= np.log10(t) <= zmax + 1e-9]
+    return (np.log10(np.maximum(lin, 10.0 ** MAP_FLOOR)), zmax,
+            [float(np.log10(t)) for t in ticks], [f"{t:g}" for t in ticks])
+
+
+def _overlay_traces(fig, overlay, density, pick=()):
     """Add the concentration traces to a sky figure (see sky_figure for their order).
 
-    picking: a pick mode is on, so the map does not answer the hover (a click lands on a
-    structure, not on the map).
+    The map is coloured by log10(map / mean) (map_scale) and its hover shows the linear map / mean
+    (customdata, only without a pick mode). pick: the pick modes that are on. With any of them
+    the map does not answer the hover with its value; with 'peaks' it answers "click: add peak" (a click on an empty place of the
+    map adds a peak), and when the density background is off a fully transparent heatmap on the
+    same grid takes its place. With 'paths' the ridges and drawn paths that are on are layout
+    shapes (sky_figure), so their traces are left empty.
     """
+    pick = tuple(pick)
+    logz, zmax, tickvals, ticktext = map_scale(overlay["map_z"])
     if density:
-        hover = dict(hoverinfo="skip") if picking else dict(
-            hovertemplate="RA %{x:.2f}  Dec %{y:.2f}<br>map/mean %{z:.2f}<extra></extra>")
+        hover = (dict(hovertemplate=CLICK_HOVER) if "peaks" in pick else
+                 dict(hoverinfo="skip") if pick else dict(
+                     customdata=np.round(np.asarray(overlay["map_z"], dtype=float), 3),
+                     hovertemplate="RA %{x:.2f}  Dec %{y:.2f}<br>map/mean "
+                                   "%{customdata:.2f}<extra></extra>"))
         fig.add_trace(go.Heatmap(
-            x=overlay["map_ra"], y=overlay["map_dec"], z=overlay["map_z"], name="concentration",
-            colorscale="Inferno", zmin=0, opacity=1.0,
+            x=overlay["map_ra"], y=overlay["map_dec"], z=logz, name="concentration",
+            colorscale="Inferno", zmin=MAP_FLOOR, zmax=zmax, opacity=1.0, hoverongaps=False,
             colorbar=dict(title=dict(text="map / mean", side="bottom"), orientation="h",
-                          thickness=10, len=0.5, y=-0.3, yanchor="top"),
+                          thickness=10, len=0.5, y=-0.3, yanchor="top", tickmode="array",
+                          tickvals=tickvals, ticktext=ticktext),
             zsmooth=False, **hover))
+    elif "peaks" in pick:
+        fig.add_trace(go.Heatmap(
+            x=overlay["map_ra"], y=overlay["map_dec"], z=logz, name="click map",
+            colorscale=CLEAR, showscale=False, showlegend=False, hoverongaps=False,
+            hovertemplate=CLICK_HOVER, zsmooth=False))
     fig.add_trace(go.Scattergl(
         x=overlay["hull_x"], y=overlay["hull_y"], mode="lines", name="survey area",
         line=dict(color=HULL, width=1.0), hoverinfo="skip"))
@@ -169,15 +210,18 @@ def _overlay_traces(fig, overlay, density, picking=False):
         x=overlay["contour1_x"], y=overlay["contour1_y"], mode="lines", name="1σ contour",
         line=dict(color=CONTOUR, width=2.8), hoverinfo="skip"))
     groups = overlay["ridge_groups"]
-    for key, name, colour, width, dash, opacity in RIDGE_STYLES[:3]:
+    for key, name, colour, width, dash, opacity in RIDGE_STYLES[:2]:
         fig.add_trace(go.Scattergl(
             x=groups[key]["x"], y=groups[key]["y"], mode="lines", name=name + " halo",
             line=dict(color=HALO, width=width + 3.0, dash=dash), hoverinfo="skip",
             showlegend=False, legendgroup=name))
+    editing = "paths" in pick
     for key, name, colour, width, dash, opacity in RIDGE_STYLES:
-        fig.add_trace(_structure_trace(groups[key], name, colour, width, dash, opacity))
+        group = NO_LINES if editing and key != "off" else groups[key]
+        fig.add_trace(_structure_trace(group, name, colour, width, dash, opacity))
     drawn = overlay["drawn"]
-    fig.add_trace(_structure_trace(drawn["on"], "drawn paths", DRAWN, 2.0, "dash"))
+    fig.add_trace(_structure_trace(NO_LINES if editing else drawn["on"], "drawn paths", DRAWN, 2.0,
+                                   "dash"))
     fig.add_trace(_structure_trace(drawn["off"], "drawn paths off", OFF, 1.5, "dot", 0.6))
     model = overlay.get("model")
     if model is not None:
@@ -201,6 +245,38 @@ def _overlay_traces(fig, overlay, density, picking=False):
                     line=dict(width=1.0, color="#111")),
         customdata=[["peak", i] for i in overlay["peak_id"]], text=overlay["peak_text"],
         hovertemplate="%{text}<extra></extra>"))
+    user = overlay.get("user_peak_id") or []
+    if user:
+        fig.add_trace(go.Scatter(
+            x=overlay["user_peak_ra"], y=overlay["user_peak_dec"], mode="markers",
+            name="peaks added by hand",
+            marker=dict(symbol="star", size=18, color=DRAWN, line=dict(width=1.0, color="#111")),
+            customdata=[["user_peak", i] for i in user],
+            text=[f"user peak {i} (click to remove)" for i in user],
+            hovertemplate="%{text}<extra></extra>"))
+
+
+def _svg_path(ra, dec):
+    """'M x,y L x,y ...' of a polyline in data coordinates (a plotly path shape)."""
+    return "M" + " L".join(f"{float(a):.5f},{float(b):.5f}" for a, b in zip(ra, dec))
+
+
+def structure_shapes(overlay):
+    """Layout shapes of the ridges and drawn paths that are on, for the Select maximums mode.
+
+    One editable path shape per item of overlay['shapes'] ({name 'ridge <id>' or 'path <id>',
+    kind, open, ra, dec}): cyan (dashed when the ridge runs to the border) for a ridge, magenta
+    dashes for a drawn path. The shape names are what struct_update reads back from relayoutData.
+    """
+    out = []
+    for s in overlay.get("shapes") or []:
+        if len(s["ra"]) < 2:
+            continue
+        line = (dict(color=DRAWN, width=2, dash="dash") if s["kind"] == "path" else
+                dict(color=RIDGE, width=3.5, dash="dash" if s["open"] else "solid"))
+        out.append(dict(type="path", path=_svg_path(s["ra"], s["dec"]), xref="x", yref="y",
+                        editable=True, name=s["name"], line=line, layer="above"))
+    return out
 
 
 def peak_annotations(overlay):
@@ -208,14 +284,22 @@ def peak_annotations(overlay):
 
     White when the peak is on, smaller and grey (OFF) when it is switched off. The
     annotation captures the click events (a dcc.Graph reports them in clickAnnotationData)
-    and is named f"peak {id}".
+    and is named f"peak {id}". The peaks added by hand (overlay['user_peak_*']) follow, as
+    magenta ★ named f"user peak {id}".
     """
-    return [dict(x=ra, y=dec, xref="x", yref="y", text="☆" if is_open else "★",
-                 showarrow=False, font=dict(size=22 if on else 16, color=PEAK if on else OFF),
-                 hovertext=text, captureevents=True, name=f"peak {pid}")
-            for ra, dec, is_open, text, on, pid in zip(
-                overlay["peak_ra"], overlay["peak_dec"], overlay["peak_open"],
-                overlay["peak_text"], overlay["peak_on"], overlay["peak_id"])]
+    notes = [dict(x=ra, y=dec, xref="x", yref="y", text="☆" if is_open else "★",
+                  showarrow=False, font=dict(size=22 if on else 16, color=PEAK if on else OFF),
+                  hovertext=text, captureevents=True, name=f"peak {pid}")
+             for ra, dec, is_open, text, on, pid in zip(
+                 overlay["peak_ra"], overlay["peak_dec"], overlay["peak_open"],
+                 overlay["peak_text"], overlay["peak_on"], overlay["peak_id"])]
+    notes += [dict(x=ra, y=dec, xref="x", yref="y", text="★", showarrow=False,
+                   font=dict(size=22, color=DRAWN), hovertext=f"user peak {pid} (click to remove)",
+                   captureevents=True, name=f"user peak {pid}")
+              for ra, dec, pid in zip(overlay.get("user_peak_ra") or [],
+                                      overlay.get("user_peak_dec") or [],
+                                      overlay.get("user_peak_id") or [])]
+    return notes
 
 
 def sky_figure(d, color_label="env", clip=(2.0, 98.0), density=True, colorscale="Viridis",
@@ -223,36 +307,47 @@ def sky_figure(d, color_label="env", clip=(2.0, 98.0), density=True, colorscale=
     """RA vs Dec (RA increasing to the left), Scattergl, box / lasso selectable.
 
     Traces, in order: 'density' (Heatmap of the 2D histogram of d, if density; with an
-    overlay it is replaced by the 'concentration' Heatmap), then, if overlay is given,
+    overlay it is replaced by the 'concentration' Heatmap, or, without density but with the
+    pick mode 'peaks', by a fully transparent 'click map' Heatmap on the same grid that only
+    catches the clicks), then, if overlay is given,
     'survey area' (the hull of the catalogue, thin grey), 'contours (2σ, 3σ, ...)',
-    '1σ contour' (heavier), the dark halos 'ridges halo', 'ridges to the border halo',
-    'low-crest ridges halo' (wide lines under the cyan ones, so that they show on every colour
-    of the map; a halo shares the legend entry of its line), the ridge segments that are on:
-    'ridges' (cyan, solid, saddle >= 1σ), 'ridges to the border' (cyan, dashed: the segment
-    reaches the border), 'low-crest ridges' (thin cyan dots: the saddle is below 1σ), then
+    '1σ contour' (heavier), the dark halos 'ridges halo', 'ridges to the border halo'
+    (wide lines under the cyan ones, so that they show on every colour of the map; a halo
+    shares the legend entry of its line), the ridge segments that are on: 'ridges' (cyan,
+    solid) and 'ridges to the border' (cyan, dashed: the segment reaches the border), then
     'ridges off' (grey dots: switched off), 'drawn paths' (magenta dashes) and 'drawn paths
     off' (grey dots), then, when overlay['model'] is set, 'model: 1σ band' (the edges, dashed),
     'model: peak circles' (same legend entry as the band) and 'model: fitted paths' (green),
     then 'peaks' (legend, hover and click; the stars drawn on the map are layout annotations,
     ★ and ☆ for peaks whose region reaches the border, white when on, smaller and grey when off,
-    rebuilt with every figure because an SVG trace would lie under the WebGL canvas); then, last
-    so that they are on top, 'spec-z', 'photo-z', 'no value' (those with data).
+    rebuilt with every figure because an SVG trace would lie under the WebGL canvas), then
+    'peaks added by hand' (only when there are some; magenta ★ annotations named 'user peak
+    <id>'); then, last so that they are on top, 'spec-z', 'photo-z', 'no value' (those with
+    data).
     customdata[0] of every point of the galaxy traces is the row of the catalogue (read back
     from selectedData); a vertex of a ridge, drawn path or peak carries customdata [kind, id]
-    with kind 'ridge', 'path' or 'peak' (read back from clickData).
+    with kind 'ridge', 'path', 'peak' or 'user_peak' (read back from clickData); a point of
+    the map Heatmap has no customdata (clickData gives its x, y, z).
 
-    overlay: dict with map_ra, map_dec, map_z (2D, the map over its mean, 0 for an empty cell,
-    NaN outside the survey area; used if density), hull_x, hull_y, contour_x, contour_y,
+    overlay: dict with map_ra, map_dec, map_z (2D, the map over its mean, NaN outside the
+    survey area; used if density or with 'peaks'; the Heatmap shows log10 of it, from 0.1 x the
+    mean to the 99.5th percentile, see map_scale, and its hover the linear value), hull_x, hull_y, contour_x, contour_y,
     contour1_x, contour1_y (lists of degrees, None separating the polylines),
-    ridge_groups {strong, open, low, off: {x, y, customdata, text}}, drawn {on, off: same},
-    model (None or path_x, path_y, band_x, band_y, circle_x, circle_y) and peak_ra, peak_dec,
-    peak_text, peak_open, peak_on, peak_id.
+    ridge_groups {strong, open, off: {x, y, customdata, text}}, drawn {on, off: same},
+    shapes ([{name, kind 'ridge' | 'path', open, ra, dec}]: the ridges and drawn paths that
+    are on, for the layout shapes), model (None or path_x, path_y, band_x, band_y, circle_x,
+    circle_y) and peak_ra, peak_dec, peak_text, peak_open, peak_on, peak_id, optionally
+    user_peak_ra, user_peak_dec, user_peak_id.
 
-    pick: the pick modes that are on ('peaks', 'paths'). With any of them the map and the
-    galaxies do not answer the hover (a click lands on a structure) and, with 'paths', the drag
-    mode is 'drawopenpath' (a freehand path), else 'select'. layout.shapes is always empty:
-    the drawn shapes become traces after the callbacks read them; editrevision (changed after
-    every drawing) makes the browser drop the shapes it still holds.
+    pick: the pick modes that are on ('peaks', 'paths'). With any of them the galaxies do not
+    answer the hover (a click lands on a structure) and the map does not show its value; with
+    'peaks' the map answers "click: add peak". With 'paths' the drag mode is 'drawopenpath' (a
+    freehand path) and the ridges and drawn paths that are on are editable layout shapes named
+    'ridge <id>' and 'path <id>' (their traces are left empty; the user activates one by a click
+    and removes it with the eraser button of the modebar), else the drag mode is 'select' and
+    layout.shapes is empty. A freehand path becomes a trace or shape after the callbacks read
+    it; editrevision (changed after every drawing and with the mode) makes the browser drop the
+    shapes it still holds.
     """
     if len(d) == 0:
         return empty_figure("No galaxies in the selected sample")
@@ -260,7 +355,7 @@ def sky_figure(d, color_label="env", clip=(2.0, 98.0), density=True, colorscale=
     d = _scaled_sizes(d, (3.0, 10.0), clip)
     fig = go.Figure()
     if overlay is not None:
-        _overlay_traces(fig, overlay, density, bool(pick))
+        _overlay_traces(fig, overlay, density, pick)
     elif density:
         counts, xe, ye = np.histogram2d(d["ra"], d["dec"], bins=bins)
         fig.add_trace(go.Heatmap(
@@ -283,7 +378,8 @@ def sky_figure(d, color_label="env", clip=(2.0, 98.0), density=True, colorscale=
     fig.update_layout(
         template="plotly_white", font=FONT, hovermode="closest",
         dragmode="drawopenpath" if "paths" in pick else "select",
-        newshape=dict(line=dict(color=DRAWN, width=2), opacity=1), shapes=[],
+        newshape=dict(line=dict(color=DRAWN, width=2), opacity=1),
+        shapes=structure_shapes(overlay) if overlay is not None and "paths" in pick else [],
         xaxis=dict(title="RA [deg]", autorange="reversed", zeroline=False),
         yaxis=dict(title="Dec [deg]", zeroline=False),
         coloraxis=_coloraxis(d, color_label, clip, colorscale), uirevision=uirevision,
@@ -292,50 +388,6 @@ def sky_figure(d, color_label="env", clip=(2.0, 98.0), density=True, colorscale=
         annotations=[] if overlay is None else peak_annotations(overlay))
     if editrevision is not None:
         fig.update_layout(editrevision=editrevision)
-    return fig
-
-
-def scatter3d_figure(d, coords="radecz", color_label="env", clip=(2.0, 98.0),
-                     colorscale="Viridis", uirevision="3d"):
-    """Scatter3d (WebGL) map; coords 'radecz' (RA, Dec, z) or 'xyz' (comoving Mpc).
-
-    Traces: 'spec-z', 'photo-z', 'no value' (those with data), then
-    'selection' (rows with d['selected']) drawn as larger open red markers.
-    """
-    if coords not in ("radecz", "xyz"):
-        raise ValueError("coords must be 'radecz' or 'xyz'")
-    if len(d) == 0:
-        return empty_figure("No galaxies in the selected sample")
-    d = _scaled_sizes(d, (2.0, 7.0), clip)
-    cx, cy, cz = (("ra", "dec", "z") if coords == "radecz" else ("cx", "cy", "cz"))
-    fig = go.Figure()
-    for name, kind, symbol, opacity, base, sub, coloured in _groups(d):
-        marker = dict(symbol=symbol, opacity=opacity, size=_sizes(sub, 2.5 * base),
-                      line=dict(width=0))
-        if coloured:
-            marker.update(color=sub["color"].to_numpy(float), coloraxis="coloraxis")
-        else:
-            marker["color"] = GREY
-        fig.add_trace(go.Scatter3d(
-            x=sub[cx].to_numpy(float), y=sub[cy].to_numpy(float), z=sub[cz].to_numpy(float),
-            mode="markers", name=name, marker=marker, customdata=_customdata(sub),
-            text=sub["id"].to_numpy(), hovertemplate=_hover(kind)))
-    if "selected" in d.columns and d["selected"].any():
-        sel = d[d["selected"].to_numpy(bool)]
-        fig.add_trace(go.Scatter3d(
-            x=sel[cx].to_numpy(float), y=sel[cy].to_numpy(float), z=sel[cz].to_numpy(float),
-            mode="markers", name="selection", hoverinfo="skip",
-            marker=dict(symbol="circle-open", size=6, color="#e34948", line=dict(width=2))))
-    if coords == "radecz":
-        scene = dict(xaxis=dict(title="RA [deg]", autorange="reversed"),
-                     yaxis=dict(title="Dec [deg]"), zaxis=dict(title="z"), aspectmode="cube")
-    else:
-        scene = dict(xaxis=dict(title="x [Mpc]"), yaxis=dict(title="y [Mpc]"),
-                     zaxis=dict(title="z [Mpc]"), aspectmode="data")
-    fig.update_layout(template="plotly_white", font=FONT, scene=scene, uirevision=uirevision,
-                      coloraxis=_coloraxis(d, color_label, clip, colorscale),
-                      margin=dict(l=0, r=0, t=10, b=0),
-                      legend=dict(orientation="h", y=1.05, x=0))
     return fig
 
 

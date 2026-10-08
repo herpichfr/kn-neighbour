@@ -3,7 +3,9 @@
 STATE_CONTROLS lists every control as (state key, component id, property);
 default_state(explorer) gives the value of each state key at start, and the
 snapshot of the app is a dict with these keys. The selection in progress on the sky map
-(store-struct) is not part of the snapshot; the model that was run (store-model) is.
+(store-struct) is not part of the snapshot; the model that was run (store-model) is. A snapshot
+with keys that are not state keys any more (such as the 3D "coords" or the old bandwidth
+"conch") is restored without them.
 """
 
 import math
@@ -28,16 +30,17 @@ STATE_CONTROLS = (
     ("morph", "f-morph", "value"),
     ("concregion", "f-concregion", "value"),
     ("concw", "conc-weight", "value"),
-    ("conch", "conc-bw", "value"),
+    ("conck", "conc-k", "value"),
+    ("concpix", "conc-pix", "value"),
     ("concstep", "conc-step", "value"),
     ("concprom", "conc-prom", "value"),
+    ("concfloor", "conc-floor", "value"),
     ("estimator", "env-estimator", "value"),
     ("k", "env-k", "value"),
     ("weight", "env-weight", "value"),
     ("dv", "env-dv", "value"),
     ("n_sigma", "env-nsigma", "value"),
     ("pzmode", "env-pzmode", "value"),
-    ("coords", "v3d-coords", "value"),
     ("color", "view-color", "value"),
     ("size", "view-size", "value"),
     ("clip", "view-clip", "value"),
@@ -51,23 +54,27 @@ STATE_CONTROLS = (
 )
 STATE_KEYS = tuple(key for key, _, _ in STATE_CONTROLS)
 SAMPLE_KEYS = ("z_range", "z_types", "p_min", "odds_min", "logm_range", "mr_max", "member",
-               "subs", "groups", "quenched", "morph", "concregion", "concw", "conch", "concstep",
-               "concprom", "model")
+               "subs", "groups", "quenched", "morph", "concregion", "concw", "conck", "concpix",
+               "concstep", "concprom", "concfloor", "model")
 ENV_KEYS = ("estimator", "k", "weight", "dv", "n_sigma", "pzmode")
 KNN3D_NOTE = "not defined for photo-z galaxies (see REPORT_photoz_validation.md)"
 DEFAULT_MASS_BINS = "8, 9, 10, 11"
-PICK_HINT = ("Select peaks: click a star, a ridge or a drawn path to switch it on / off. Select "
-             "maximums: drag along a ridge to draw a path (clicks do not register while drawing: "
-             "uncheck it to click). Run model fits the structures that are on to the crest of the "
-             "map and gives the 1σ band around them.")
-STRUCTURE_HEADER = ("structure", "kind", "s [Mpc]", "intrinsic s [Mpc]", "crest [σ] (mean / min)",
-                    "length [Mpc]", "shift [Mpc]", "N in band")
+PICK_HINT = ("Select peaks: click a star, a ridge or a drawn path to switch it on / off; click an "
+             "empty place of the map to add a peak (a magenta star); click a magenta star to remove "
+             "it. Select maximums: drag along a ridge to draw a path (clicks do not register while "
+             "drawing: uncheck it to click); click a ridge or a drawn path to activate it and press "
+             "the eraser (Erase active shape) in the toolbar to remove it. Run model fits the "
+             "structures that are on to the crest of the map and gives the 1σ band around them.")
+STRUCTURE_HEADER = ("structure", "kind", "s [Mpc]", "crest [σ] (mean / min)", "length [Mpc]",
+                    "shift [Mpc]", "N in band")
 
 
 def default_struct():
     """Value of store-struct at start: the structures of the sky map that are switched off, the
-    drawn paths ({id, ra, dec, on, src}) and the map (map_key) the off ids belong to."""
-    return {"map_key": None, "off_peaks": [], "off_ridges": [], "paths": [], "next_id": 1}
+    drawn paths ({id, ra, dec, on, src}), the peaks added by hand ({id, ra, dec}; the ids of both
+    come from next_id) and the map (map_key) the off ids and the added peaks belong to."""
+    return {"map_key": None, "off_peaks": [], "off_ridges": [], "paths": [], "user_peaks": [],
+            "next_id": 1}
 
 
 def logm_bounds(explorer):
@@ -92,19 +99,21 @@ def default_state(explorer):
     z_range = list(conc["z_range"]) if conc and conc["z_range"] else list(explorer.window)
     z_types = ["spec"] if conc and conc["sample"] == "spec" else ["spec", "phot"]
     conc_ctl = explorer.default_concentration() if conc else {
-        "weight": "count", "bandwidth_mpc": None, "contour_step_sigma": 1.0,
-        "min_prominence_sigma": 1.0}
+        "weight": "count", "k": 10, "pixel_mpc": None, "contour_step_sigma": 1.0,
+        "min_prominence_sigma": 1.0, "ridge_floor_sigma": 5.0}
     return {
         "z_range": z_range, "z_types": z_types, "p_min": 0.0,
         "odds_min": 0.0, "logm_range": [lo, hi], "mr_max": None, "member": [], "subs": [],
         "groups": [], "quenched": "any", "morph": [], "concregion": "any",
-        "concw": conc_ctl["weight"], "conch": conc_ctl["bandwidth_mpc"],
+        "concw": conc_ctl["weight"], "conck": conc_ctl["k"],
+        "concpix": conc_ctl["pixel_mpc"],
         "concstep": conc_ctl["contour_step_sigma"], "concprom": conc_ctl["min_prominence_sigma"],
+        "concfloor": conc_ctl["ridge_floor_sigma"],
         "estimator": env["name"], "k": env["k"], "weight": env["weight"],
         "dv": env["dv"] if env["dv"] is not None else 1500.0,
         "n_sigma": env["n_sigma"] if env["n_sigma"] is not None else 1.5,
         "pzmode": env["photoz_mode"] if env["photoz_mode"] != "none" else explorer.settings["mode"],
-        "coords": "radecz", "color": "env", "size": None, "clip": [2, 98], "density": ["on"],
+        "color": "env", "size": None, "clip": [2, 98], "density": ["on"],
         "y": y, "x": "env", "mass_bins": DEFAULT_MASS_BINS if explorer.has_column("logmstar") else "",
         "nbins": 8, "imgfmt": "png", "model": None,
     }
@@ -191,10 +200,16 @@ def _concentration_section(explorer, st):
             id="conc-weight", options=_options(conc_weight_options(explorer)), value=st["concw"],
             clearable=False, disabled=off),
                "count, stellar mass (capped), or a catalogue column"),
-        _field("Bandwidth [Mpc]", dcc.Input(
-            id="conc-bw", type="number", min=0.1, step=0.1, value=st["conch"], debounce=True,
-            placeholder="Scott", className="num", disabled=off),
-               "empty = Scott's rule on the sample positions"),
+        _field("k (nearest neighbour)", dcc.Input(
+            id="conc-k", type="number", min=2, step=1, value=st["conck"], debounce=True,
+            className="num", disabled=off),
+               "density = weight of the k nearest galaxies / area of the disc that reaches the "
+               "k-th (integer >= 2)"),
+        _field("Map pixel [Mpc]", dcc.Input(
+            id="conc-pix", type="number", min=0.05, step=0.05, value=st["concpix"],
+            debounce=True, placeholder="h/2", className="num", disabled=off),
+               "empty = h / 2 (h = the kNN scale); each cell is the mean of 3 x 3 sub-points, "
+               "so a larger pixel smooths the map"),
         _field("Contour step [σ]", dcc.Input(
             id="conc-step", type="number", min=0.1, step=0.1, value=st["concstep"],
             debounce=True, className="num", disabled=off),
@@ -203,6 +218,10 @@ def _concentration_section(explorer, st):
             id="conc-prom", type="number", min=0, step=0.1, value=st["concprom"],
             debounce=True, className="num", disabled=off),
                "peaks lower than this above their saddle are not marked"),
+        _field("Ridge floor [σ]", dcc.Input(
+            id="conc-floor", type="number", min=1, step=0.5, value=st["concfloor"],
+            debounce=True, className="num", disabled=off),
+               "automatic ridges only run through cells at or above mean + floor σ (at least 1)"),
     ], open_=not off)
 
 
@@ -234,10 +253,6 @@ def _environment_section(explorer, st):
 def _view_section(explorer, st):
     cols = explorer.numeric_columns() + explorer.boolean_columns()
     return _section("View", [
-        _field("3D coordinates", dcc.RadioItems(
-            id="v3d-coords", options=[{"label": " RA, Dec, z", "value": "radecz"},
-                                      {"label": " x, y, z [Mpc]", "value": "xyz"}],
-            value=st["coords"], inline=True, className="check")),
         _field("Colour by", dcc.Dropdown(id="view-color", options=_options(cols),
                                          value=st["color"], clearable=False)),
         _field("Size by", dcc.Dropdown(id="view-size", options=_options(cols),
@@ -265,7 +280,7 @@ def _export_section(explorer, st):
             id="export-imgfmt", options=[{"label": " PNG", "value": "png"},
                                          {"label": " SVG", "value": "svg"}],
             value=st["imgfmt"], inline=True, className="check"),
-               "SVG of WebGL traces (3D, sky) is rasterised by plotly."),
+               "SVG of WebGL traces (sky) is rasterised by plotly."),
         dcc.Download(id="dl-csv"), dcc.Download(id="dl-snapshot"), dcc.Download(id="dl-pdf"),
     ])
 
@@ -274,6 +289,17 @@ def _graph(graph_id, height, name):
     return dcc.Loading(dcc.Graph(id=graph_id, figure=empty_figure("Loading..."),
                                  config=graph_config("png", name),
                                  style={"height": height}), type="dot")
+
+
+def _sky_graph():
+    """The sky map: full width of its column and square (the graph itself has width 100% and CSS
+    aspect-ratio 1 / 1, with no height, so that plotly sizes itself to it), with the eraser
+    button of the plotly modebar (it removes the active ridge or drawn path in Select maximums
+    mode)."""
+    return dcc.Loading(
+        dcc.Graph(id="sky-fig", figure=empty_figure("Loading..."),
+                  config=graph_config("png", "knn_sky", erase=True),
+                  style={"width": "100%", "aspectRatio": "1 / 1"}), type="dot")
 
 
 def _analysis_section(explorer, st):
@@ -349,12 +375,10 @@ def structure_table_rows(model, counts):
     label to the number of galaxies of the selection inside its band."""
     rows = [list(STRUCTURE_HEADER)]
     for p in model["peaks"]:
-        rows.append([p["label"], "peak", f"{p['width_mpc']:.2f}", f"{p['width_intrinsic_mpc']:.2f}",
-                     f"{p['n_sigma']:.1f}", "-", f"{p['shift_mpc']:.2f}",
-                     str(counts.get(p["label"], 0))])
+        rows.append([p["label"], "peak", f"{p['width_mpc']:.2f}", f"{p['n_sigma']:.1f}", "-",
+                     f"{p['shift_mpc']:.2f}", str(counts.get(p["label"], 0))])
     for p in model["paths"]:
         rows.append([p["label"], "path", f"{p['width_median_mpc']:.2f}",
-                     f"{p['width_intrinsic_median_mpc']:.2f}",
                      f"{p['crest_n_sigma_mean']:.1f} / {p['crest_n_sigma_min']:.1f}",
                      f"{p['length_mpc']:.1f}", f"{p['shift_max_mpc']:.2f}",
                      str(counts.get(p["label"], 0))])
@@ -382,7 +406,8 @@ def _mass_section(explorer):
 
 
 def _pick_controls(explorer):
-    """Controls of the interactive sky map: pick modes, switch all, draw, run the model.
+    """Controls of the interactive sky map: pick modes, switch all, clear what was drawn or added,
+    run the model.
 
     Always in the tree (the callbacks read them); hidden and disabled without a
     'concentration' section.
@@ -390,7 +415,7 @@ def _pick_controls(explorer):
     off = explorer.conc_settings is None
     buttons = [html.Button(label, id=cid, n_clicks=0, disabled=off) for cid, label in (
         ("btn-pick-all", "All on"), ("btn-pick-none", "All off"),
-        ("btn-clear-paths", "Clear drawn paths"))]
+        ("btn-clear-paths", "Clear drawn"))]
     run = [html.Button(label, id=cid, n_clicks=0, disabled=off) for cid, label in (
         ("btn-run-model", "Run model"), ("btn-clear-model", "Clear model"))]
     return html.Div([
@@ -406,7 +431,8 @@ def _pick_controls(explorer):
 
 
 def build_layout(explorer):
-    """Full page: header, sidebar (sample, environment, view, export), views, analysis."""
+    """Full page: header, sidebar (sample, concentration, environment, view, export), the sky map,
+    analysis."""
     st = default_state(explorer)
     n_spec, n_phot = explorer.counts(np.ones(len(explorer.df), dtype=bool))
     header = html.Div([
@@ -423,15 +449,12 @@ def build_layout(explorer):
     ], className="sidebar")
     main = html.Div([
         html.Div([
-            html.Div([html.H3("3D map"), _graph("v3d-fig", "520px", "knn_3d")], className="col"),
-            html.Div([
-                html.H3("Sky"),
-                html.Div([html.Button("Clear selection", id="clear-selection", n_clicks=0),
-                          html.Span(id="sel-info", className="counts")], className="row tight"),
-                _pick_controls(explorer),
-                _graph("sky-fig", "560px", "knn_sky"),
-            ], className="col"),
-        ], className="row"),
+            html.H3("Sky"),
+            html.Div([html.Button("Clear selection", id="clear-selection", n_clicks=0),
+                      html.Span(id="sel-info", className="counts")], className="row tight"),
+            _pick_controls(explorer),
+            _sky_graph(),
+        ], className="sky-panel"),
         _analysis_section(explorer, st),
     ] + ([_mass_section(explorer)] if explorer.conc_settings is not None else []),
         className="main")

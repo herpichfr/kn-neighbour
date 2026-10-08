@@ -7,7 +7,12 @@ widths (`filaments.py`, `fil_*` columns, spines sidecar), which found no usable 
 dropped. Slice 0.017 < z < 0.024, 1879 galaxies (1785 spec-z, 94 photo-z). The map is projected only (see
 the line-of-sight argument: LOS 1 sigma 11.1 Mpc spec-z, 28.7 Mpc photo-z).
 
-## Method
+**Update 2026-10-08:** the map is now a k-th nearest-neighbour surface density and the automatic
+ridges have a 5 sigma floor (last section). The method, results and verification sections below
+describe the earlier weighted Gaussian KDE map (Scott bandwidth) and its ridge network without a
+floor; their numbers do not apply to the current code.
+
+## Method (Gaussian KDE map, replaced)
 
 - Map: weighted 2D KDE on the tangent plane in Mpc at D_A(z = 0.02) = 83.6 Mpc. Weight `count`, `mass`
   (10^logM* x p_in_window, clipped at the 95th percentile) or any column. Bandwidth by Scott's rule
@@ -115,3 +120,125 @@ draws the fitted paths, bands (cut at the survey border) and peak circles, the i
 model counts, no console errors. Two snap defects found in the browser were fixed (drift onto another
 ridge: capped at 1 h; retraction of a path up the cluster slope: fixed-normal correspondence). Plotly
 sends no clicks while drawing, so Select maximums is for drawing only. Test temporaries removed.
+
+## kNN map and 5σ ridge floor (2026-10-08)
+
+Requested by the author: drop the 3D panel, make the sky map full width and square, replace the
+density map by the k-th nearest-neighbour (kNN) relation, put a 5 sigma floor under the automatic
+ridges, let the user add peaks and remove the automatic ridges. Code: `concentration.py`,
+`config/mkw4.yaml`, `app/{layout,callbacks,figures}.py`, `app/assets/style.css`. This section
+describes the method change; the sections above (KDE) are kept as history.
+
+Method change:
+
+- Map: at the centre p of every grid cell inside the survey hull, r_k(p) is the projected distance
+  (Mpc, tangent plane at D_A(z = 0.02)) to the k-th nearest galaxy of the slice sample (cKDTree),
+  and Sigma(p) = W_k / A with W_k the sum of the weights of the k nearest galaxies (k for the count
+  weight) and A the area of the disc of radius r_k inside the hull, A = pi r_k^2 f, f floored at
+  COVER_FLOOR = 0.2 (at most 5 times). f is computed numerically with 128 points of a fixed
+  sunflower pattern in the unit disc, scaled by r_k and tested with `in_hull` (a disc farther than
+  r_k from every edge is not sampled); it agrees with the circular-segment area to 0.01 in the
+  tests. k is the setting `k` (default 10, integer, 2 <= k <= sample size - 1); it replaces
+  `bandwidth_mpc` (the old key is now an unknown config key).
+- Scale h = the median over the galaxies of the sample of the distance to their k-th neighbour
+  (the galaxy excluded), reported as the kNN scale. It sets the cell (h / 4 in this first version, h / 2 since the subsection below, unless `pixel_mpc`) and
+  every length of the model (PEAK_SEARCH, SNAP_MAX, WINDOW, PROFILE_*, in units of h). The cell
+  depends on the slice through h, so two slices share the hull but not the grid unless
+  `pixel_mpc` is set.
+- The estimator k / (pi r_k^2) is high by k / (k - 1) on a uniform field (5 % at k = 20; checked in
+  the tests, together with the flat map up to the hull border) and is noisier than a kernel map: the
+  relative noise is about 1 / sqrt(k), the map has a heavy upper tail, and cells far from the sample
+  are low but positive (never exactly 0). Mean and sigma are over the footprint as before.
+- The Gaussian-kernel intrinsic width sqrt(s^2 - h^2) is no longer defined and was removed from
+  the model outputs, the structure table and `describe_model`; s is the width of the Gaussian that
+  fits the kNN map (it still contains the resolution of the map). `scott_bandwidth` and
+  `density_map` were removed.
+- Ridge floor (`ridge_floor_sigma`, default 5, at least 1): the maximin tree is restricted to the
+  cells at or above mean + floor x sigma, which makes it a forest. In each connected component with
+  at least two terminals (significant peaks at or above the floor, border ends: the highest cell of
+  each run of border cells at or above the floor) the network is the Steiner subtree of that tree,
+  cut into segments as before. A peak alone above the floor, or below it, has no ridge (degree 0),
+  and a map can have no ridge. The old rule that every peak connects to another is dropped; the
+  low-crest style (saddle < 1 sigma) cannot occur and was removed. Ridges have a `component`
+  number; `info` has `ridge_floor_sigma`, `ridge_floor_level`, `n_peaks_above_floor` and
+  `n_ridge_components`. Drawn paths of the model are not subject to the floor.
+- App: no 3D panel (state key `coords` ignored when a snapshot is restored); the sky panel is the
+  full width of the main column and square (CSS `aspect-ratio: 1 / 1` on `.sky-square`); Concentration
+  section: "k (nearest neighbour)" (state `conck`, id `conc-k`) replaces the bandwidth (`conch`),
+  "Ridge floor [σ]" (`concfloor`, `conc-floor`). Select peaks: a click on a map cell with no
+  structure adds a peak (`user_peaks` in store-struct, ids from `next_id`, magenta ★ annotation named
+  `user peak <id>`; the position is the centre of the clicked heatmap cell; reset when the map
+  changes; "Clear drawn" removes them with the drawn paths; All on / All off leave them); a click on
+  its star removes it; they enter the model after the automatic peaks that are on and are refined to
+  the highest cell within 1 h. The heatmap answers "click: add peak" in that mode, with a
+  transparent click-catcher heatmap when the density background is off. Select maximums: the ridges
+  and drawn paths that are on are editable layout shapes named `ridge <id>` / `path <id>`; the eraser
+  of the modebar sends the remaining shapes in relayoutData and `struct_update` switches the missing
+  ones off (a ridge goes to `off_ridges`, a drawn path gets `on = False`: not deleted); unnamed shapes
+  are new drawn paths; edits of named shapes are not read back (`rev` moves so that the figure
+  restores them).
+
+MKW4 with the first version of the map (cell h / 4, value at the cell centre; superseded by the
+subsection below) (slice 0.017 < z < 0.024, sample all, 1879 galaxies, 4942 rows set the hull, weight clip 95,
+min prominence 1 sigma, ridge floor 5 sigma, contour step 1 sigma), computed with
+`Explorer.concentration` on `data/MKW4+v7.parquet` (built in memory from `config/mkw4.yaml`):
+
+| weight | k | h [Mpc] (cell) | levels | max | significant peaks (above the floor) | five highest peaks (RA, Dec, n sigma; o = open) | ridges at 5 sigma: segments, components | ridges at a 1 sigma floor (reference) | inside 1 sigma spec / photo |
+|---|---|---|---|---|---|---|---|---|---|
+| mass | 10 | 0.82 (0.20) | 12 | 39.4 sigma | 33 (14) | (181.15, 1.76) 39.4; (186.04, 9.35) 27.8 o; (175.71, 8.80) 20.0; (179.62, -2.01) 19.8; (187.83, 0.50) 14.5 | 2, 2 | 8, 7 | 448 / 7 |
+| count | 10 | 0.82 (0.20) | 12 | 36.0 sigma | 37 (16) | (181.15, 1.76) 36.0; (187.83, 0.50) 19.0; (182.69, 0.64) 15.9; (179.62, -2.15) 14.5; (182.69, 1.06) 11.9 | 2, 1 | 11, 3 | 631 / 12 |
+| mass | 5 | 0.55 (0.14) | 12 | 52.9 sigma | 72 (37) | (176.70, -3.86) 52.9; (180.90, 2.02) 47.0; (181.18, 1.83) 45.8; (179.40, -1.26) 38.8; (175.57, 8.86) 28.5 | 2, 1 | 16, 7 | 460 / 4 |
+| count | 5 | 0.55 (0.14) | 12 | 55.3 sigma | 90 (44) | (181.18, -2.38) 55.3; (179.40, -1.26) 54.1; (177.35, -1.07) 53.8; (176.70, -3.86) 38.0; (182.96, 1.36) 37.4 | 2, 1 | 30, 13 | 637 / 10 |
+
+(Every map has 12 levels, the maximum, because the maxima are 36-55 sigma and more levels are
+thinned; for k = 10 the highest peak is the cluster at (181.1, 1.8).)
+
+- With the floor at its default the network is two segments in every map, each 0.3-0.9 Mpc long
+  (k = 10, mass: saddles 5.5 and 5.2 sigma, 0.6 and 0.9 Mpc; count: 7.5 and 6.5 sigma, 0.6 and
+  0.5 Mpc; k = 5, mass: 12.6 and 6.7 sigma, 0.5 and 0.7 Mpc; count: 10.4 and 7.8 sigma, 0.3 and
+  0.8 Mpc). They join neighbouring bumps inside the dense cores (for k = 10, mass, one of them
+  ends at the cluster peak (181.15, 1.76)); none is open and none is longer than 0.9 Mpc. Most
+  peaks above the floor have no ridge (degree 0). The floor was not tuned.
+- The kNN map is spiky: the maximum is 36-55 sigma and, in units of the global sigma, a bump of
+  1 sigma prominence is common, so the default `min_prominence_sigma` = 1 marks 33-90 peaks
+  (the KDE map had 1-9). A larger prominence or k is the way to thin them; the tests use 6 sigma.
+- Galaxies inside 1 sigma differ from the KDE at Scott's bandwidth (mass 566 / 22, count 540 / 29):
+  mass 448 / 7 and count 631 / 12 at k = 10.
+- The older tables and the 1 sigma counts above refer to the KDE map; the `conc_*` columns of
+  `data/derived/MKW4_enriched.parquet` are those of the KDE until `knn build` is run again (the
+  config changed, so the app builds in memory).
+
+Verification of this round: `pytest` 217 passed (old tests updated where the behaviour changed by
+design; new ones for the kNN map against an independent cKDTree computation, the disc fraction
+against the circular segment, the floor, the forest, user peaks, shape events, the layout and the
+snapshot with the stale `coords` key). Not verified in a browser: whether plotly keeps `name` of
+layout shapes in relayoutData and activates editable path shapes by a click in `drawopenpath` mode,
+whether the eraser sends the remaining shapes, whether a ridge or path vertex click wins over the
+heatmap in closest hover mode, and the square layout at several widths.
+
+### Coarser, averaged cells (pixel h / 2, 3 x 3 sub-points)
+
+Requested to smooth the map while keeping the 5 sigma floor. The default cell is now h / 2
+(`PIXELS_PER_SCALE` = 2; 0.41 Mpc at k = 10, 4 times fewer cells), and the value of a cell is the
+mean of the kNN density at the 3 x 3 points of a regular sub-grid of the cell that lie inside the
+hull (`SUBSAMPLES` = 3; each point has its own edge correction; a cell whose centre is in the hull
+but none of whose sub-points is takes its centre value; at most `MAX_EVALUATIONS` = 12 million
+density evaluations, cells x 9). Levels, peaks, ridges, the model and the `conc_*` columns use this
+map; `conc_density` of a galaxy is still the map interpolated at its position. New app input "Map
+pixel [Mpc]" (state `concpix`, empty = h / 2, setting `pixel_mpc`); the map summary shows the cell and
+the grid. In a random field at 0.4 Mpc the spread of the difference between neighbouring cells
+falls from 5.0 to 4.0 (galaxies per Mpc^2, same mean). Floor unchanged (5 sigma), minimum
+prominence 1 sigma, k = 10, slice 0.017-0.024, sample all (1879 galaxies), h = 0.82 Mpc:
+
+| weight | pixel [Mpc] | grid (nx x ny) | max | significant peaks (above floor) | ridges: segments, components | inside 1 sigma spec / photo |
+|---|---|---|---|---|---|---|
+| mass | h / 2 = 0.41 (default) | 80 x 72 | 20.3 sigma | 22 (7) | 0, 0 | 501 / 7 |
+| mass | h = 0.82 | 43 x 39 | 14.0 sigma | 14 (5) | 0, 0 | 540 / 9 |
+| count | h / 2 = 0.41 (default) | 80 x 72 | 21.1 sigma | 23 (7) | 0, 0 | 674 / 13 |
+| count | h = 0.82 | 43 x 39 | 14.4 sigma | 17 (4) | 0, 0 | 660 / 18 |
+
+(Every map has 12 levels.) With the coarser, averaged map the maximum falls from 36-39 to 20-21 sigma
+and the significant peaks from 33-37 to 22-23, but no ridge survives the 5 sigma floor at either
+pixel: the two sub-Mpc segments of the first version (saddles 5.2-7.5 sigma) are gone, because
+averaging lowers the saddles between neighbouring bumps below the floor. The floor was not tuned.
+The first-version tables above (cell h / 4, centre value) are not reproduced by the current code.

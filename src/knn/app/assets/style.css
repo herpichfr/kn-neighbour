@@ -39,6 +39,8 @@ button:hover { filter: brightness(1.1); }
 .col { flex: 1 1 420px; min-width: 0; background: var(--panel); border: 1px solid var(--line);
   border-radius: 6px; padding: 6px 10px; }
 .main h3 { margin: 4px 0 6px; font-size: 15px; }
+.sky-panel { background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+  padding: 6px 10px 10px; }
 .analysis { margin-top: 12px; background: var(--panel); border: 1px solid var(--line);
   border-radius: 6px; padding: 6px 12px 12px; }
 .analysis .row .field { flex: 0 1 220px; }

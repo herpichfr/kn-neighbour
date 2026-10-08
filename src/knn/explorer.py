@@ -573,7 +573,7 @@ class Explorer:
                                   band of that model (model_inside of Explorer.model)
                                   instead of the 1 sigma contour; empty = the contour
         conc_params {...}         keyword arguments of Explorer.concentration (weight,
-                                  bandwidth_mpc, ...) for conc_region and conc_model
+                                  k, ridge_floor_sigma, ...) for conc_region and conc_model
 
         An empty list means no filter. A filter whose column is missing from
         the catalogue raises KeyError. Unknown keys raise ValueError.
@@ -680,15 +680,16 @@ class Explorer:
     def default_concentration(self):
         """The concentration controls of the config for the app.
 
-        Keys: weight, bandwidth_mpc, contour_step_sigma, min_prominence_sigma. None for
-        bandwidth_mpc means Scott's rule. Needs a 'concentration' section in the config.
+        Keys: weight, k, pixel_mpc, contour_step_sigma, min_prominence_sigma, ridge_floor_sigma.
+        Needs a 'concentration' section in the config.
         """
         if self.conc_settings is None:
             raise ValueError("the config has no 'concentration' section")
         s = self.conc_settings
-        return {"weight": s["weight"], "bandwidth_mpc": s["bandwidth_mpc"],
+        return {"weight": s["weight"], "k": s["k"], "pixel_mpc": s["pixel_mpc"],
                 "contour_step_sigma": s["contour_step_sigma"],
-                "min_prominence_sigma": s["min_prominence_sigma"]}
+                "min_prominence_sigma": s["min_prominence_sigma"],
+                "ridge_floor_sigma": s["ridge_floor_sigma"]}
 
     def _conc_key(self, mask, params):
         """(settings, mask, cache key) of a concentration request."""
@@ -707,8 +708,8 @@ class Explorer:
 
         mask: boolean array, default the build sample (z_range and sample of the
         config). params override the 'concentration' section of the config (weight,
-        weight_clip, bandwidth_mpc, pixel_mpc, contour_step_sigma, min_prominence_sigma;
-        None = the config value). The survey footprint is that of all the rows of the
+        weight_clip, k, pixel_mpc, contour_step_sigma, min_prominence_sigma,
+        ridge_floor_sigma; None = the config value). The survey footprint is that of all the rows of the
         catalogue, whatever the mask. Results are cached (LRU, CONC_CACHE_SIZE): the same
         arguments return the identical objects, which callers must not modify. Raises
         ValueError without a 'concentration' section and ConcentrationError for a sample

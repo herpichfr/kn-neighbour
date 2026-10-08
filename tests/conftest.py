@@ -10,6 +10,11 @@ from knn.explorer import Explorer
 from synthetic import (BUILD_CONFIG, COSMO, CONC_TRUTH, build_synthetic_config, conc_positions,
                        write_build_catalogue)
 
+# k = 20 (a kNN scale of about 1 Mpc), peaks that rise 6 sigma above their saddle (a kNN map has
+# noise bumps inside a clump) and the lowest ridge floor allowed, the 1 sigma level
+CONC_SECTION = {"z_range": [0.014, 0.028], "sample": "all", "weight": "mass", "k": 20,
+                "min_prominence_sigma": 6.0, "ridge_floor_sigma": 1.0}
+
 
 @pytest.fixture(scope="session")
 def built(tmp_path_factory):
@@ -41,7 +46,7 @@ def conc_built(tmp_path_factory):
     df["RA"], df["DEC"] = ra, dec
     df.to_parquet(root / "data" / "cat.parquet", index=False)
     raw = copy.deepcopy(BUILD_CONFIG)
-    raw["concentration"] = {"z_range": [0.014, 0.028], "sample": "all", "weight": "mass"}
+    raw["concentration"] = CONC_SECTION
     path = root / "config" / "t.yaml"
     path.parent.mkdir(exist_ok=True)
     path.write_text(yaml.safe_dump(raw))

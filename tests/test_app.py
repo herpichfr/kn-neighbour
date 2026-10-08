@@ -1,5 +1,6 @@
 import base64
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -12,8 +13,8 @@ EXPECTED_IDS = {
     "f-z", "f-ztype", "f-pwin", "f-odds", "f-logm", "f-mr", "f-member", "f-subs", "f-group",
     "f-quenched", "f-morph", "sample-counts",
     "env-estimator", "env-k", "env-weight", "env-dv", "env-nsigma", "env-pzmode", "env-note",
-    "env-status", "v3d-coords", "view-color", "view-size", "view-clip", "sky-density",
-    "v3d-fig", "sky-fig", "clear-selection", "sel-info", "an-y", "an-x", "an-massbins",
+    "env-status", "view-color", "view-size", "view-clip", "sky-density",
+    "sky-fig", "clear-selection", "sel-info", "an-y", "an-x", "an-massbins",
     "an-nbins", "an-fig", "an-hist", "an-counts", "btn-csv", "btn-snapshot", "btn-pdf",
     "up-snapshot", "snapshot-status", "export-imgfmt", "dl-csv", "dl-snapshot", "dl-pdf",
     "store-sample", "store-env", "store-sel",
@@ -35,6 +36,31 @@ def test_create_app_and_layout_ids(app, explorer):
     assert len(set(STATE_KEYS)) == len(STATE_KEYS)
 
 
+def _holder(component, pred):
+    """The component of the tree below `component` for which pred(c) holds (None if none)."""
+    return next((c for c in component._traverse() if pred(c)), None)
+
+
+def test_there_is_no_3d_panel_and_the_sky_map_is_square_and_full_width(app):
+    ids = _ids(app.layout)
+    assert "v3d-fig" not in ids and "v3d-coords" not in ids
+    assert "coords" not in STATE_KEYS and "v3d-coords" not in {cid for _, cid, _ in STATE_CONTROLS}
+    panel = _holder(app.layout, lambda c: getattr(c, "className", None) == "sky-panel")
+    assert "sky-fig" in _ids(panel) and "an-fig" not in _ids(panel)
+    # the panel is a direct child of the main column, not in a row beside another panel
+    main = _holder(app.layout, lambda c: getattr(c, "className", None) == "main")
+    assert any(child is panel for child in main.children)
+    assert not any(getattr(c, "className", "") == "row" and "sky-fig" in _ids(c)
+                   and "an-fig" in _ids(c) for c in main._traverse())
+    graph = _holder(panel, lambda c: getattr(c, "id", None) == "sky-fig")
+    assert graph.config["modeBarButtonsToAdd"] == ["eraseshape"]
+    # square and full width through the graph's own style: no height (plotly would get 0 from a
+    # percentage of an auto-height parent), no absolute positioning in the stylesheet
+    assert graph.style == {"width": "100%", "aspectRatio": "1 / 1"}
+    css = (Path(__file__).parents[1] / "src" / "knn" / "app" / "assets" / "style.css").read_text()
+    assert "sky-square" not in css and "position: absolute" not in css
+
+
 def test_http_endpoints(app):
     client = app.server.test_client()
     page = client.get("/")
@@ -48,7 +74,7 @@ def test_http_endpoints(app):
 
 def test_callbacks_are_registered(app):
     outputs = " ".join(app.callback_map)
-    for target in ("sky-fig.figure", "v3d-fig.figure", "an-fig.figure", "an-hist.figure",
+    for target in ("sky-fig.figure", "an-fig.figure", "an-hist.figure",
                    "store-env.data", "store-sample.data", "store-sel.data", "dl-csv.data",
                    "dl-pdf.data", "dl-snapshot.data", "env-note.children", "snapshot-status"):
         assert target in outputs, target
@@ -134,8 +160,6 @@ def test_figure_callbacks_with_default_inputs(explorer, stores):
     state, sample, env = stores
     sky = cb.sky_callback(explorer, state, env, sample)
     assert [t.name for t in sky.data] == ["density", "spec-z", "photo-z"]
-    f3 = cb.scatter3d_callback(explorer, state, env, sample)
-    assert [t.name for t in f3.data] == ["spec-z", "photo-z"]
     trend, hist, text = cb.analysis_callback(explorer, state, env, sample)
     assert len(trend.data) > 0 and [t.name for t in hist.data] == ["full sample", "selection"]
     assert "N/bin" in text and "log M*" in text
@@ -145,11 +169,8 @@ def test_figure_callbacks_with_default_inputs(explorer, stores):
 
 def test_figure_callbacks_with_other_options(explorer, stores):
     _, sample, env = stores
-    state = cb.make_state(explorer, coords="xyz", color="logmstar", size="M_r", clip=[10, 90],
+    state = cb.make_state(explorer, color="logmstar", size="M_r", clip=[10, 90],
                           density=[], y="logmstar", x="logmstar", mass_bins="", nbins=4)
-    f3 = cb.scatter3d_callback(explorer, state, env, sample, sel_rows=[0, 1, 2])
-    assert f3.data[-1].name == "selection" and len(f3.data[-1].x) == 3
-    assert f3.layout.scene.xaxis.title.text == "x [Mpc]"
     sky = cb.sky_callback(explorer, state, env, sample, clear_clicks=2)
     assert sky.data[0].name != "density" and sky.layout.uirevision == "sky2"
     trend, hist, text = cb.analysis_callback(explorer, state, env, sample)
@@ -213,6 +234,12 @@ def test_export_csv_pdf_and_snapshot(explorer, stores):
                                                   "matches_config": False})
     restored = dict(zip(STATE_KEYS, values))
     assert restored["k"] == 4 and restored["estimator"] == "sigma2d" and "different config" in message
+    # a snapshot of the version with the 3D panel and the Gaussian bandwidth still loads
+    values, message = cb.restore_state(explorer, {"state": {"coords": "xyz", "conch": 1.5, "k": 6},
+                                                  "matches_config": True})
+    restored = dict(zip(STATE_KEYS, values))
+    assert restored["k"] == 6 and "coords" not in restored and "conch" not in restored
+    assert restored["conck"] == default_state(explorer)["conck"] and message == "Snapshot loaded."
 
 
 def test_download_callbacks_over_http(app, explorer, stores):
@@ -240,12 +267,15 @@ def test_download_callbacks_over_http(app, explorer, stores):
 
 
 def test_graph_config_callback_over_http(app):
-    key = next(k for k in app.callback_map if "v3d-fig.config" in k)
+    key = next(k for k in app.callback_map if "sky-fig.config" in k)
+    assert "v3d-fig" not in key
     resp = _call(app, key[2:-2].split("..."), [("export-imgfmt", "value", "svg")])
     assert resp.status_code == 200
     configs = resp.get_json()["response"]
     assert configs["sky-fig"]["config"]["toImageButtonOptions"]["format"] == "svg"
     assert configs["an-hist"]["config"]["toImageButtonOptions"]["filename"] == "knn_hist"
+    assert configs["sky-fig"]["config"]["modeBarButtonsToAdd"] == ["eraseshape"]
+    assert "modeBarButtonsToAdd" not in configs["an-hist"]["config"]
 
 
 def test_restore_callback_over_http(app, explorer):
@@ -271,5 +301,5 @@ def test_serve_command_line(explorer, monkeypatch):
     assert cli.main(["serve", path, "--port", "8765", "--debug"]) == 0
     assert seen["port"] == 8765 and seen["debug"] is True and seen["host"] == "127.0.0.1"
     assert seen["cfg"]["_meta"]["path"] == path
-    assert cli.main(["serve", path, "--host", "0.0.0.0"]) == 0 and seen["port"] == 8050
+    assert cli.main(["serve", path, "--host", "0.0.0.0"]) == 0 and seen["port"] == 8765
     assert cli.main(["serve", "/nonexistent.yaml"]) == 2

@@ -11,9 +11,10 @@ come from the Explorer's cache); a box / lasso selection on the sky makes
 store-sel (catalogue rows). The figure callbacks read these stores and send
 only the plotted columns to the browser.
 
-The sky map is interactive (with a 'concentration' section): clicks and drawn paths
-update store-struct (struct_update: which peaks and ridge segments are off, the paths
-drawn by the user); "Run model" turns the structures that are on into a model spec
+The sky map is interactive (with a 'concentration' section): clicks, drawn paths and
+erased shapes update store-struct (struct_update: which peaks and ridge segments are off, the
+paths drawn by the user, the peaks added by the user); "Run model" turns the structures that
+are on into a model spec
 (run_spec), kept in store-model, which store-sample carries (sample['model']) so that
 every view follows it (the inside / outside filter, the statistics table, the overlay).
 """
@@ -31,8 +32,8 @@ from dash import Input, Output, State, ctx, dcc, html, no_update
 from ..explorer import NONE_LABEL, _as_float
 from ..concentration import (ConcentrationError, contour_table, describe, describe_model, hull_sky,
                              peak_table, ridge_table, sky_grid)
-from .figures import (counts_text, empty_figure, graph_config, hist_figure, scatter3d_figure, sky_figure,
-                      trend_figure, trend_matplotlib)
+from .figures import (counts_text, empty_figure, graph_config, hist_figure, sky_figure, trend_figure,
+                      trend_matplotlib)
 from .layout import (ENV_KEYS, KNN3D_NOTE, SAMPLE_KEYS, STATE_CONTROLS, STATE_KEYS, default_state,
                      default_struct, logm_bounds, mass_table_component, structure_table_component)
 
@@ -88,11 +89,14 @@ def filters_from_state(explorer, state):
 
 
 def conc_params(state):
-    """Arguments of Explorer.concentration from the concentration controls (None = config / Scott)."""
+    """Arguments of Explorer.concentration from the concentration controls (None = the config value)."""
+    k = state.get("conck")
     return {"weight": state.get("concw") or None,
-            "bandwidth_mpc": state.get("conch") or None,
+            "k": int(k) if isinstance(k, float) and k.is_integer() else (k or None),
+            "pixel_mpc": state.get("concpix") or None,
             "contour_step_sigma": state.get("concstep") or None,
-            "min_prominence_sigma": state.get("concprom")}
+            "min_prominence_sigma": state.get("concprom"),
+            "ridge_floor_sigma": state.get("concfloor") or None}
 
 
 def env_params(state):
@@ -225,7 +229,7 @@ def _label(explorer, name, info):
     return f"log(1+δ) {info['name']} k={info['k']}{suffix}"
 
 
-def build_view(explorer, state, env, sample, sel_rows=None):
+def build_view(explorer, state, env, sample):
     """View frame (figures module docstring) of the sample rows."""
     info = env
     frame = explorer.env(**_env_args(info))
@@ -238,12 +242,9 @@ def build_view(explorer, state, env, sample, sel_rows=None):
         "row": idx, "id": explorer.ids[idx], "ra": df["ra"].to_numpy(float)[idx],
         "dec": df["dec"].to_numpy(float)[idx], "z": df["z_best"].to_numpy(float)[idx],
         "z_type": explorer.z_type[idx], "logm": logm[idx], "env": frame["env"].to_numpy()[idx],
-        "cx": df["cx"].to_numpy(float)[idx], "cy": df["cy"].to_numpy(float)[idx],
-        "cz": df["cz"].to_numpy(float)[idx],
         "color": column_values(explorer, state["color"], frame)[idx]})
     if state.get("size"):
         d["size"] = column_values(explorer, state["size"], frame)[idx]
-    d["selected"] = np.isin(idx, np.asarray(sel_rows, dtype=int)) if sel_rows else False
     return d
 
 
@@ -327,17 +328,18 @@ def _polylines(items):
     return out
 
 
+def _user_peaks(struct, sample):
+    """The peaks added by hand ({id, ra, dec}) of store-struct on the map of sample."""
+    if not struct or struct.get("map_key") != (sample or {}).get("map_key"):
+        return []
+    return list(struct.get("user_peaks") or [])
+
+
 def _off_ids(struct, sample, key):
     """Ids of the structures switched off ('off_peaks' / 'off_ridges') on the map of sample."""
     if not struct or struct.get("map_key") != (sample or {}).get("map_key"):
         return set()
     return {int(i) for i in struct.get(key) or []}
-
-
-def _strong(ridge):
-    """True for a ridge segment whose saddle is at least 1 sigma (or has none)."""
-    s = ridge["saddle_n_sigma"]
-    return s is None or not np.isfinite(s) or s >= 1.0
 
 
 def _model_overlay(model):
@@ -353,9 +355,11 @@ def _model_overlay(model):
 def concentration_overlay(explorer, sample, struct=None):
     """Map, contours, survey border, ridges, drawn paths, model and peaks for the sky figure, or None.
 
-    struct is store-struct: ridges and peaks it switches off (on the map it belongs to) and
-    the drawn paths; None = everything on, nothing drawn. The model overlay is that of
-    sample['model'] (model_result); a model that fails is left out.
+    struct is store-struct: ridges and peaks it switches off (on the map it belongs to), the
+    drawn paths and the peaks added by hand; None = everything on, nothing drawn. The model
+    overlay is that of sample['model'] (model_result); a model that fails is left out. 'shapes'
+    lists the ridges and drawn paths that are on, as the editable shapes of the Select maximums
+    mode (named 'ridge <id>' and 'path <id>').
     """
     try:
         found = concentration_result(explorer, sample)
@@ -372,20 +376,27 @@ def concentration_overlay(explorer, sample, struct=None):
                                         for ln in c["lines"]])
     off_ridges, off_peaks = _off_ids(struct, sample, "off_ridges"), _off_ids(struct, sample,
                                                                              "off_peaks")
-    styled = {"strong": [], "open": [], "low": [], "off": []}
+    styled, shapes = {"strong": [], "open": [], "off": []}, []
     for r in ridge_table(result):
         on = r["id"] not in off_ridges
         s = r["saddle_n_sigma"]
         text = (f"ridge {r['id']}, saddle {s:.1f}σ, {r['length_mpc']:.1f} Mpc "
                 f"({'on' if on else 'off'})" if s is not None and np.isfinite(s) else
                 f"ridge {r['id']}, {r['length_mpc']:.1f} Mpc ({'on' if on else 'off'})")
-        key = "off" if not on else ("low" if not _strong(r) else ("open" if r["open"] else "strong"))
+        key = "off" if not on else ("open" if r["open"] else "strong")
         styled[key].append((r["ra"], r["dec"], ["ridge", r["id"]], text))
+        if on:
+            shapes.append({"name": f"ridge {r['id']}", "kind": "ridge", "open": r["open"],
+                           "ra": r["ra"], "dec": r["dec"]})
     drawn = {"on": [], "off": []}
     for q in (struct or {}).get("paths") or []:
         drawn["on" if q["on"] else "off"].append(
             (q["ra"], q["dec"], ["path", q["id"]],
              f"drawn path {q['id']} ({'on' if q['on'] else 'off'})"))
+        if q["on"]:
+            shapes.append({"name": f"path {q['id']}", "kind": "path", "open": False,
+                           "ra": q["ra"], "dec": q["dec"]})
+    user = _user_peaks(struct, sample)
     try:
         fitted = model_result(explorer, sample)
     except ValueError:
@@ -396,7 +407,9 @@ def concentration_overlay(explorer, sample, struct=None):
             "hull_y": hull_dec.tolist(), "contour_x": contour_x, "contour_y": contour_y,
             "contour1_x": contour1_x, "contour1_y": contour1_y,
             "ridge_groups": {k: _polylines(v) for k, v in styled.items()},
-            "drawn": {k: _polylines(v) for k, v in drawn.items()},
+            "drawn": {k: _polylines(v) for k, v in drawn.items()}, "shapes": shapes,
+            "user_peak_id": [q["id"] for q in user], "user_peak_ra": [q["ra"] for q in user],
+            "user_peak_dec": [q["dec"] for q in user],
             "model": None if fitted is None else _model_overlay(fitted[1]),
             "peak_id": [p["id"] for p in peaks], "peak_ra": [p["ra"] for p in peaks],
             "peak_dec": [p["dec"] for p in peaks], "peak_open": [p["open"] for p in peaks],
@@ -441,23 +454,43 @@ STRUCT_TRIGGERS = {"sky-fig.clickData": "click", "sky-fig.clickAnnotationData": 
 
 
 def _click_target(click):
-    """(kind, id) of the structure vertex of a Graph's clickData, or None (galaxies carry numbers)."""
+    """What a Graph's clickData hit: (kind, id) of a structure vertex, ('map', (ra, dec)) for a
+    cell of the map, or None (galaxies carry numbers, not [kind, id]).
+
+    A point whose customdata is [kind, id] with kind 'peak', 'ridge', 'path' or 'user_peak' is the
+    structure (it wins whatever else was under the cursor). A point with no customdata and a
+    finite z is a cell of the map heatmap (the trace that answers "click: add peak"): its x, y are
+    the centre of the cell, in degrees.
+    """
     points = (click or {}).get("points") or []
-    cd = points[0].get("customdata") if points and isinstance(points[0], dict) else None
-    if isinstance(cd, (list, tuple)) and len(cd) == 2 and cd[0] in ("peak", "ridge", "path"):
+    point = points[0] if points and isinstance(points[0], dict) else {}
+    cd = point.get("customdata")
+    if isinstance(cd, (list, tuple)) and len(cd) == 2 and cd[0] in (
+            "peak", "ridge", "path", "user_peak"):
         try:
             return cd[0], int(round(float(cd[1])))
         except (TypeError, ValueError):
             return None
+    if cd is None and isinstance(point.get("z"), (int, float)) and np.isfinite(point["z"]):
+        try:
+            ra, dec = float(point["x"]), float(point["y"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if np.isfinite(ra) and np.isfinite(dec):
+            return "map", (ra, dec)
     return None
 
 
 def _annotation_target(data):
-    """('peak', id) of a Graph's clickAnnotationData whose annotation is named 'peak <id>'."""
+    """('peak' | 'user_peak', id) of a Graph's clickAnnotationData whose annotation is named
+    'peak <id>' or 'user peak <id>'."""
     data = data if isinstance(data, dict) else {}
     note = data.get("fullAnnotation") or data.get("annotation") or data
-    found = re.fullmatch(r"peak (\d+)", str(note.get("name") or "")) if isinstance(note, dict) else None
-    return ("peak", int(found.group(1))) if found else None
+    found = (re.fullmatch(r"(user )?peak (\d+)", str(note.get("name") or ""))
+             if isinstance(note, dict) else None)
+    if not found:
+        return None
+    return ("user_peak" if found.group(1) else "peak"), int(found.group(2))
 
 
 def _toggled(ids, ident):
@@ -475,33 +508,69 @@ def _map_ids(explorer, sample):
     return [p["id"] for p in found[1]["peaks"]], [r["id"] for r in found[1]["ridges"]]
 
 
+def _shape_ids(shapes):
+    """(ridge ids, path ids) of the named shapes ('ridge <id>', 'path <id>') of a shapes list."""
+    ridges, paths = set(), set()
+    for shape in shapes:
+        found = re.fullmatch(r"(ridge|path) (\d+)", str(shape.get("name") or "")) \
+            if isinstance(shape, dict) else None
+        if found:
+            (ridges if found.group(1) == "ridge" else paths).add(int(found.group(2)))
+    return ridges, paths
+
+
 def struct_update(explorer, struct, sample, pick, trigger, click=None, relayout=None):
     """New store-struct after an event of the sky map (the input struct is not modified).
 
     trigger: 'click' (click = the Graph's clickData), 'annotation' (click = clickAnnotationData
-    of a peak star), 'relayout' (relayout = relayoutData: new drawn shapes), 'all', 'none',
-    'clear_paths' or 'sample' (nothing but the map check). pick: the pick modes that are on
-    ('peaks', 'paths'). 'peaks' is the click mode: a click toggles a peak, a ridge or a drawn
-    path ('paths' also toggles ridges and drawn paths, but plotly sends no click while it is
-    drawing); a shape drawn while 'paths' is on becomes a path
-    (once: shapes already stored, by their SVG path string, are ignored). A change of map
-    (sample['map_key']) switches every peak and ridge on again (the ids belong to the old map);
-    the drawn paths stay. 'rev' counts the drawings read, so that the figure drops the shapes.
+    of a star), 'relayout' (relayout = relayoutData: shapes), 'all', 'none', 'clear_paths' or
+    'sample' (nothing but the map check). pick: the pick modes that are on ('peaks', 'paths').
+
+    'peaks' is the click mode. A click on a ridge vertex, a drawn path vertex or a peak star
+    toggles it ('paths' also toggles ridges and drawn paths, but plotly sends no click while
+    it is drawing); a click on a magenta star (an annotation named 'user peak <id>') removes that
+    peak; a click on a cell of the map (a heatmap point, see _click_target, no structure under
+    it) adds a peak at the centre of that cell, {id (next_id), ra, dec}, in user_peaks. A
+    structure vertex in clickData wins over the map.
+
+    'paths' is the draw mode, with the ridges and drawn paths that are on shown as editable
+    shapes named 'ridge <id>' and 'path <id>'. relayoutData with a 'shapes' list (a drawing or
+    the eraser of the modebar) is read as follows: a named ridge shape of a ridge that is on and
+    is missing from the list was erased: its id goes to off_ridges; a named path shape missing
+    for a drawn path that is on switches that path off (it is not deleted: a click in the 'peaks'
+    mode switches it on again, 'Clear drawn' deletes it); a shape with no name is a new freehand
+    path (once: a shape whose SVG path string is already stored stands for that path); the
+    geometry of the named shapes is never read back. A relayoutData whose keys edit a shape ('shapes[i].path',
+    ...) changes nothing but 'rev', so that the figure puts the shape back. 'rev' counts the
+    shape events read, so that the figure drops the shapes of the browser.
+
+    A change of map (sample['map_key']) switches every peak and ridge on again and removes the
+    peaks added by hand (the ids belong to the old map); the drawn paths stay. 'All on' and
+    'All off' act on the peaks, ridges and drawn paths, not on the peaks added by hand;
+    'clear_paths' (button 'Clear drawn') deletes the drawn paths and the peaks added by hand.
     """
     struct = copy.deepcopy(struct) if struct else default_struct()
+    struct.setdefault("user_peaks", [])
     if not sample:
         return struct
     pick = set(pick or ())
     key = sample.get("map_key")
     if struct.get("map_key") != key:
-        struct.update(map_key=key, off_peaks=[], off_ridges=[])
+        struct.update(map_key=key, off_peaks=[], off_ridges=[], user_peaks=[])
     if trigger in ("click", "annotation"):
         target = _click_target(click) if trigger == "click" else _annotation_target(click)
         if target is None:
             return struct
         kind, ident = target
-        if kind == "peak" and "peaks" in pick:
+        if kind == "map":
+            if "peaks" in pick:
+                struct["user_peaks"].append({"id": struct["next_id"], "ra": ident[0],
+                                             "dec": ident[1]})
+                struct["next_id"] += 1
+        elif kind == "peak" and "peaks" in pick:
             struct["off_peaks"] = _toggled(struct["off_peaks"], ident)
+        elif kind == "user_peak" and "peaks" in pick:
+            struct["user_peaks"] = [q for q in struct["user_peaks"] if q["id"] != ident]
         elif kind == "ridge" and pick & {"peaks", "paths"}:
             struct["off_ridges"] = _toggled(struct["off_ridges"], ident)
         elif kind == "path" and pick & {"peaks", "paths"}:
@@ -509,11 +578,21 @@ def struct_update(explorer, struct, sample, pick, trigger, click=None, relayout=
                 if path["id"] == ident:
                     path["on"] = not path["on"]
     elif trigger == "relayout" and "paths" in pick:
-        shapes = (relayout or {}).get("shapes")
+        relayout = relayout if isinstance(relayout, dict) else {}
+        shapes = relayout.get("shapes")
         if isinstance(shapes, list):
+            seen_ridges, seen_paths = _shape_ids(shapes)
+            unnamed = {s.get("path") for s in shapes if isinstance(s, dict) and not s.get("name")}
+            shown = set(_map_ids(explorer, sample)[1]) - set(struct["off_ridges"])
+            struct["off_ridges"] = sorted(set(struct["off_ridges"]) | (shown - seen_ridges))
+            for path in struct["paths"]:
+                if path["on"] and path["id"] not in seen_paths and path["src"] not in unnamed:
+                    path["on"] = False
             known = {q["src"] for q in struct["paths"]}
             for shape in shapes:
-                src = shape.get("path") if isinstance(shape, dict) else None
+                if not isinstance(shape, dict) or shape.get("name"):
+                    continue
+                src = shape.get("path")
                 if not isinstance(src, str) or src in known:
                     continue
                 known.add(src)
@@ -527,6 +606,8 @@ def struct_update(explorer, struct, sample, pick, trigger, click=None, relayout=
                                         "src": src})
                 struct["next_id"] += 1
             struct["rev"] = struct.get("rev", 0) + 1
+        elif any(re.match(r"shapes\[\d+\]", str(name)) for name in relayout):
+            struct["rev"] = struct.get("rev", 0) + 1
     elif trigger == "all":
         struct.update(off_peaks=[], off_ridges=[])
         for path in struct["paths"]:
@@ -538,6 +619,7 @@ def struct_update(explorer, struct, sample, pick, trigger, click=None, relayout=
             path["on"] = False
     elif trigger == "clear_paths":
         struct["paths"] = []
+        struct["user_peaks"] = []
     return struct
 
 
@@ -545,7 +627,8 @@ def run_spec(explorer, sample, struct):
     """Model spec (Explorer.model) of the structures that are on, with 'time' and 'map_key'.
 
     Peaks (ra, dec) and ridge segments (label 'ridge <id>') of the map of the sample, minus
-    the ones struct switches off, and the drawn paths that are on (label 'drawn <id>').
+    the ones struct switches off, then the peaks added by hand, and the drawn paths that are
+    on (label 'drawn <id>').
     Raises ConcentrationError when there is no map or nothing is selected.
     """
     found = concentration_result(explorer, sample)
@@ -558,7 +641,8 @@ def run_spec(explorer, sample, struct):
              for r in ridge_table(result) if r["id"] not in off_ridges]
     paths += [{"label": f"drawn {q['id']}", "ra": list(q["ra"]), "dec": list(q["dec"])}
               for q in (struct or {}).get("paths") or [] if q["on"]]
-    spec = {"peaks": [[p["ra"], p["dec"]] for p in peak_table(result) if p["id"] not in off_peaks],
+    spec = {"peaks": [[p["ra"], p["dec"]] for p in peak_table(result) if p["id"] not in off_peaks]
+            + [[q["ra"], q["dec"]] for q in _user_peaks(struct, sample)],
             "paths": paths, "time": time.strftime("%H:%M:%S"), "map_key": sample.get("map_key")}
     if not spec["peaks"] and not spec["paths"]:
         raise ConcentrationError("select at least one peak or path")
@@ -566,7 +650,7 @@ def run_spec(explorer, sample, struct):
 
 
 def pick_counts(explorer, sample, struct):
-    """Text of pick-info: 'peaks on 3/4, ridges on 5/6, drawn 1'."""
+    """Text of pick-info: 'peaks on 3/4, ridges on 5/6, drawn 1, added peaks 2'."""
     paths = (struct or {}).get("paths") or []
     n_on = sum(1 for q in paths if q["on"])
     drawn = f"drawn {n_on}" + (f"/{len(paths)}" if n_on != len(paths) else "")
@@ -574,7 +658,8 @@ def pick_counts(explorer, sample, struct):
     off_peaks = _off_ids(struct, sample, "off_peaks") & set(peak_ids)
     off_ridges = _off_ids(struct, sample, "off_ridges") & set(ridge_ids)
     return (f"peaks on {len(peak_ids) - len(off_peaks)}/{len(peak_ids)}, ridges on "
-            f"{len(ridge_ids) - len(off_ridges)}/{len(ridge_ids)}, {drawn}")
+            f"{len(ridge_ids) - len(off_ridges)}/{len(ridge_ids)}, {drawn}, added peaks "
+            f"{len(_user_peaks(struct, sample))}")
 
 
 def model_status(model, skipped=()):
@@ -613,17 +698,12 @@ def sky_callback(explorer, state, env, sample, clear_clicks=0, struct=None, pick
     comes with the sample.
     """
     d = build_view(explorer, state, env, sample)
+    pick = tuple(pick or ())
     return sky_figure(d, _label(explorer, state["color"], env), clip_of(state),
                       density=bool(state["density"]), uirevision=f"sky{clear_clicks}",
                       overlay=concentration_overlay(explorer, sample, struct), pick=pick,
-                      editrevision=f"sky{clear_clicks}-{(struct or {}).get('rev', 0)}")
-
-
-def scatter3d_callback(explorer, state, env, sample, sel_rows=None):
-    """3D figure for the current sample, highlighting the sky-view selection rows."""
-    d = build_view(explorer, state, env, sample, sel_rows)
-    return scatter3d_figure(d, state["coords"], _label(explorer, state["color"], env),
-                            clip_of(state))
+                      editrevision=f"sky{clear_clicks}-{(struct or {}).get('rev', 0)}-"
+                                   f"{'draw' if 'paths' in pick else 'view'}")
 
 
 def parse_mass_bins(text):
@@ -708,7 +788,7 @@ def concentration_callback(explorer, env, sample, sel_rows=None):
 def structures_table(explorer, sample, sel_rows=None):
     """Component of the model-table output: one row per peak and path of the model.
 
-    Width s and intrinsic width, crest (n sigma), length, shift from the input and the
+    Width s, crest (n sigma), length, shift from the input and the
     number of galaxies of the selection (sample and sky selection) inside the band of the
     structure. An empty Div without a model, or when it fails.
     """
@@ -876,15 +956,6 @@ def register_callbacks(app, explorer):
             action = "clear" if ctx.triggered_id == "btn-clear-model" else "run"
             return run_model(explorer, sample, struct, action)
 
-    v3d_keys = ["coords", "color", "size", "clip"]
-
-    @app.callback(Output("v3d-fig", "figure"), Input("store-sample", "data"),
-                  Input("store-env", "data"), Input("store-sel", "data"), *_pick(v3d_keys))
-    def _v3d(sample, env, sel, *values):
-        if not sample or not env:
-            return no_update
-        return scatter3d_callback(explorer, partial_state(v3d_keys, values), env, sample, sel)
-
     an_keys = ["y", "x", "mass_bins", "nbins"]
 
     @app.callback(Output("an-fig", "figure"), Output("an-hist", "figure"),
@@ -907,13 +978,12 @@ def register_callbacks(app, explorer):
             return ([html.Div(line) for line in lines], table, caption,
                     structures_table(explorer, sample, sel))
 
-    graph_ids = ("v3d-fig", "sky-fig", "an-fig", "an-hist")
-    graph_names = {"v3d-fig": "knn_3d", "sky-fig": "knn_sky", "an-fig": "knn_trend",
-                   "an-hist": "knn_hist"}
+    graph_ids = ("sky-fig", "an-fig", "an-hist")
+    graph_names = {"sky-fig": "knn_sky", "an-fig": "knn_trend", "an-hist": "knn_hist"}
 
     @app.callback(*[Output(g, "config") for g in graph_ids], Input("export-imgfmt", "value"))
     def _graph_config(fmt):
-        return tuple(graph_config(fmt, graph_names[g]) for g in graph_ids)
+        return tuple(graph_config(fmt, graph_names[g], erase=g == "sky-fig") for g in graph_ids)
 
     export_keys = ["color", "size", "x", "y", "mass_bins", "nbins"]
 

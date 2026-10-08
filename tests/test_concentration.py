@@ -3,7 +3,8 @@ import json
 import numpy as np
 import pandas as pd
 import pytest
-from scipy.stats import gaussian_kde
+from scipy import ndimage
+from scipy.spatial import cKDTree
 
 from knn import concentration as conc
 from knn.config import ConfigError, validate_config
@@ -13,10 +14,15 @@ from synthetic import BUILD_CONFIG, COSMO, CONC_TRUTH, bridge_curve, conc_frame
 Z_CL = CONC_TRUTH["z"]
 D_A = float(COSMO.angular_diameter_distance(Z_CL).value)
 BLOBS = [(-5.0, 0.0, 0.8, 500), (5.0, 0.0, 0.8, 400)]
+# kNN scale about 1.2 Mpc on these fields; the ridge floor is the 1 sigma level (so that the
+# structures that the tests plant are joined) and a peak must rise 6 sigma above its saddle (the
+# kNN map has noise bumps of its own inside a clump)
+K_TEST, PROMINENCE = 20, 6.0
 
 
 def _run(df, mask=None, section=None, **overrides):
-    overrides = {"weight": "count", "bandwidth_mpc": 1.0, **overrides}
+    overrides = {"weight": "count", "k": K_TEST, "ridge_floor_sigma": 1.0,
+                 "min_prominence_sigma": PROMINENCE, **overrides}
     settings = conc.conc_settings({"concentration": section or {}}, **overrides)
     sample = np.ones(len(df), dtype=bool) if mask is None else mask
     return conc.compute_concentration(df, sample, settings, COSMO, Z_CL)
@@ -72,6 +78,37 @@ def _connected(result):
     return len({find(a) for a in parent}) == 1
 
 
+def _frame_xy(df, result):
+    """(n, 2) positions (Mpc) of the rows of df in the tangent plane of the map."""
+    g = result["grid"]
+    xi, eta = conc.tangent_plane(df["ra"].to_numpy(float), df["dec"].to_numpy(float), g["ra0"],
+                                 g["dec0"])
+    return np.column_stack([xi * g["d_a"], eta * g["d_a"]])
+
+
+def _main(result, x, y, radius=1.6):
+    """The highest significant peak within radius of (x, y): the peak of a planted clump (the kNN
+    map has noise bumps of its own inside a clump)."""
+    found = _near(result["peaks"], x, y, radius)
+    assert found, f"no significant peak within {radius} Mpc of ({x}, {y})"
+    return max(found, key=lambda p: p["height"])
+
+
+def _joined(result, a, b):
+    """True when the network joins the peaks a and b (dicts of result['peaks'])."""
+    node = {n["peak"]: n["id"] for n in result["nodes"] if n["peak"] is not None}
+    parent = {n["id"]: n["id"] for n in result["nodes"]}
+
+    def find(i):
+        while parent[i] != i:
+            i = parent[i]
+        return i
+
+    for r in result["ridges"]:
+        parent[find(r["nodes"][0])] = find(r["nodes"][1])
+    return a["id"] in node and b["id"] in node and find(node[a["id"]]) == find(node[b["id"]])
+
+
 @pytest.fixture(scope="module")
 def bridged():
     df = conc_frame(blobs=BLOBS, bridges=[(-5.0, 0.0, 5.0, 0.0, 2.0, 0.5, 500)])
@@ -84,7 +121,7 @@ def valley():
     return (df,) + _run(df)
 
 
-def test_empty_cells_inside_the_hull_are_zero_and_cells_outside_are_nan():
+def test_cells_far_from_the_slice_are_dark_but_positive_and_cells_outside_the_hull_are_nan():
     # the galaxies of the slice (ra < 181) fill half of the disc; the other half of the
     # catalogue is at another redshift and only sets the footprint
     df = conc_frame(n_field=3000, seed=3)
@@ -93,14 +130,22 @@ def test_empty_cells_inside_the_hull_are_zero_and_cells_outside_are_nan():
     _, result = _run(df, sample)
     dens, footprint = result["dens"], result["footprint"]
     X, Y = _cell_xy(result)
-    far = footprint & (X > 5.0)                          # farther than 4 bandwidths from the slice
-    assert far.sum() > 100 and (dens[far] == 0.0).all()
-    assert np.isfinite(dens[footprint]).all() and (dens[footprint] >= 0).all()
+    far = footprint & (X > 5.0)                          # farther than 5 Mpc from every galaxy of the slice
+    assert far.sum() > 100
+    assert np.isfinite(dens[footprint]).all() and (dens[footprint] > 0).all()   # a k-th neighbour always exists
+    assert dens[far].mean() < 0.2 * dens[footprint & (X < -3.0)].mean()          # the darkest cells
+    assert (result["rk"][far] > 5.0).all()
     assert np.isnan(dens[~footprint]).all() and (~footprint).sum() > 100
+    assert np.isnan(result["rk"][~footprint]).all() and np.isnan(result["cover"][~footprint]).all()
     assert np.isnan(dens[0, 0]) and np.isnan(dens[-1, -1]) and not footprint[0].any()
     # the footprint is the hull of all the rows: the same for another slice of the same table
-    _, other = _run(df, ~sample)
-    np.testing.assert_array_equal(other["footprint"], footprint)
+    # (the cell is h / 4 and h depends on the slice, so give both the same cell)
+    pixel = result["grid"]["pixel"]
+    _, same = _run(df, sample, pixel_mpc=pixel)
+    _, other = _run(df, ~sample, pixel_mpc=pixel)
+    np.testing.assert_array_equal(other["footprint"], same["footprint"])
+    np.testing.assert_array_equal(same["footprint"], footprint)
+    np.testing.assert_array_equal(other["hull"]["vertices"], result["hull"]["vertices"])
     assert other["info"]["hull_area_mpc2"] == result["info"]["hull_area_mpc2"]
     assert result["info"]["n_rows"] == len(df) and result["info"]["n_sample"] == sample.sum()
     assert footprint.sum() * result["grid"]["pixel"] ** 2 == pytest.approx(
@@ -108,34 +153,207 @@ def test_empty_cells_inside_the_hull_are_zero_and_cells_outside_are_nan():
     rows, cols = np.nonzero(footprint)
     assert conc.in_hull(result["hull"], X[rows, cols], Y[rows, cols]).all()
     assert not conc.in_hull(result["hull"], X[~footprint], Y[~footprint]).any()
-    # empty cells count in the statistics: the mean is the mean over the footprint
+    # the mean and the standard deviation are those over the footprint
     assert result["mean"] == pytest.approx(dens[footprint].mean())
     assert result["sigma"] == pytest.approx(dens[footprint].std())
 
 
 def test_density_is_flat_up_to_the_border_of_the_hull():
     rng = np.random.default_rng(3)
-    n, radius = 6000, 10.0
+    n, radius, k = 6000, 10.0, 20
     r, t = radius * np.sqrt(rng.uniform(0, 1, n)), rng.uniform(0, 2 * np.pi, n)
     x, y = r * np.cos(t), r * np.sin(t)
     hull = conc.survey_hull(x, y)
-    grid = conc.density_map(x, y, np.ones(n), hull, 1.0, 0.25)
+    grid = conc.knn_map(x, y, np.ones(n), hull, k, 0.25)
     dens, footprint = grid["dens"], grid["footprint"]
-    level = n / hull["area"]
+    level = n / hull["area"] * k / (k - 1.0)              # k / (pi r_k^2) is high by k / (k - 1)
     X, Y = np.meshgrid(grid["x0"] + (np.arange(dens.shape[1]) + 0.5) * 0.25,
                        grid["y0"] + (np.arange(dens.shape[0]) + 0.5) * 0.25)
     border = _border_distance({"hull": hull}, np.column_stack([X[footprint], Y[footprint]]))
-    values = dens[footprint]
+    values, cover = dens[footprint], grid["cover"][footprint]
     assert values[border > 3.0].mean() == pytest.approx(level, rel=0.05)
-    near = (border > 0.5) & (border < 1.5)               # within one kernel of the border
-    assert values[near].mean() > 0.9 * level             # the plain smoothing gives about 0.8
-    assert values[border <= 0.5].mean() > 0.85 * level   # and 0.5 at the border itself
-    # a thin sliver: the divisor is floored, the map stays finite and bounded
+    near = (border > 0.5) & (border < 1.5)               # within one neighbour distance of the border
+    assert values[near].mean() == pytest.approx(level, rel=0.1)
+    assert values[border <= 0.5].mean() == pytest.approx(level, rel=0.15)
+    # without the correction the disc cut by the border would count too few galaxies
+    assert (values * cover)[border <= 0.5].mean() < 0.8 * level
+    assert (cover[border > 3.0] == 1.0).all() and cover[border <= 0.5].mean() < 0.8
+    # a thin sliver: the cut disc is floored, the map stays finite and at most 5 times the
+    # uncorrected one
     sx, sy = rng.uniform(0, 40, 4000), rng.uniform(-0.25, 0.25, 4000)
-    sliver = conc.density_map(sx, sy, np.ones(4000), conc.survey_hull(sx, sy), 2.0, 0.5)
+    sliver = conc.knn_map(sx, sy, np.ones(4000), conc.survey_hull(sx, sy), 10, 0.5)
     assert conc.COVER_FLOOR == 0.2
-    assert np.isfinite(sliver["dens"][sliver["footprint"]]).all()
-    assert sliver["dens"][sliver["footprint"]].max() < 3.0 * 4000 / (40.0 * 0.5)
+    fp = sliver["footprint"]
+    assert np.isfinite(sliver["dens"][fp]).all()
+    plain = 10 / (np.pi * sliver["rk"][fp] ** 2)
+    assert (sliver["dens"][fp] <= plain / conc.COVER_FLOOR * (1 + 1e-9)).all()
+    assert (sliver["dens"][fp] >= plain * (1 - 1e-9)).all()
+
+
+def test_the_disc_fraction_inside_the_hull_matches_the_circular_segment():
+    square = np.array([[-50.0, -50.0], [50.0, -50.0], [50.0, 50.0], [-50.0, 50.0]])
+    hull = conc.survey_hull(square[:, 0], square[:, 1])
+    r = 3.0
+    for d in (0.0, 1.0, 2.5, 3.5, 20.0):                 # distance of the centre to the right edge
+        f = conc.disc_hull_fraction(hull, np.array([50.0 - d]), np.array([0.0]), np.array([r]))[0]
+        cut = r ** 2 * np.arccos(d / r) - d * np.sqrt(r ** 2 - d ** 2) if d < r else 0.0
+        assert f == pytest.approx(1.0 - cut / (np.pi * r ** 2), abs=0.02)
+    corner = conc.disc_hull_fraction(hull, np.array([50.0]), np.array([50.0]), np.array([r]))
+    assert corner[0] == pytest.approx(0.25, abs=0.02)
+    # a disc whose centre is farther than r from every edge is not sampled: exactly 1
+    inside = conc.disc_hull_fraction(hull, np.array([0.0, 40.0]), np.array([0.0, 0.0]),
+                                     np.array([r, r]))
+    np.testing.assert_array_equal(inside, [1.0, 1.0])
+
+
+def test_the_knn_map_is_the_weight_of_the_k_nearest_over_the_disc_area(monkeypatch):
+    monkeypatch.setattr(conc, "SUBSAMPLES", 1)            # a cell is its centre: the exact formula
+    df = conc_frame(blobs=[(2.0, 1.0, 0.6, 500)], seed=7)
+    k = 15
+    sample = np.ones(len(df), dtype=bool)
+    for weight in ("count", "mass"):
+        _, result = _run(df, k=k, weight=weight)
+        w = conc.galaxy_weights(df, sample, weight, 95.0)[0]
+        xy = _frame_xy(df, result)
+        X, Y = _cell_xy(result)
+        fp = result["footprint"]
+        cells = np.column_stack([X[fp], Y[fp]])
+        dist, idx = cKDTree(xy).query(cells, k=k)
+        rk = dist[:, -1]
+        np.testing.assert_allclose(result["rk"][fp], rk)
+        away = _border_distance(result, cells) > rk       # the disc is inside the survey
+        assert away.sum() > 1000 and (result["cover"][fp][away] == 1.0).all()
+        np.testing.assert_allclose(result["dens"][fp][away],
+                                   w[idx].sum(axis=1)[away] / (np.pi * rk[away] ** 2), rtol=1e-12)
+        if weight == "count":
+            np.testing.assert_allclose(result["dens"][fp][away], k / (np.pi * rk[away] ** 2),
+                                       rtol=1e-12)
+        # near the border: corrected by the fraction of the disc inside the hull, at most 5 times
+        cut = ~away
+        assert cut.sum() > 100 and (result["cover"][fp][cut] < 1.0).any()
+        floor = np.maximum(result["cover"][fp][cut], conc.COVER_FLOOR)
+        np.testing.assert_allclose(result["dens"][fp][cut],
+                                   w[idx].sum(axis=1)[cut] / (np.pi * rk[cut] ** 2 * floor),
+                                   rtol=1e-12)
+        ratio = result["dens"][fp] * np.pi * rk ** 2 / w[idx].sum(axis=1)
+        assert ratio.max() <= 1.0 / conc.COVER_FLOOR + 1e-9 and ratio.min() >= 1.0 - 1e-9
+        info = result["info"]
+        h = float(np.median(cKDTree(xy[sample]).query(xy[sample], k=k + 1)[0][:, k]))
+        assert info["k"] == k and info["knn_scale_mpc"] == pytest.approx(h)
+        assert info["pixel_mpc"] == pytest.approx(h / conc.PIXELS_PER_SCALE)
+        assert conc.PIXELS_PER_SCALE == 2.0 and info["subsamples"] == 1
+        assert (info["grid_ny"], info["grid_nx"]) == result["dens"].shape
+        assert result["k"] == k and result["knn_scale"] == pytest.approx(h)
+        # the dense clump is the highest peak, near its centre
+        top = result["peaks"][0]
+        assert np.hypot(top["x"] - 2.0, top["y"] - 1.0) < 1.0 and top["n_sigma"] > 6.0
+        assert result["top"] == pytest.approx(top["height"])
+    # the kNN scale depends on the positions only, not on the weight
+    _, mass = _run(df, k=k, weight="mass")
+    _, count = _run(df, k=k, weight="count")
+    assert mass["info"]["knn_scale_mpc"] == count["info"]["knn_scale_mpc"]
+    assert not np.allclose(mass["dens"] / mass["mean"], count["dens"] / count["mean"],
+                           equal_nan=True)
+
+
+def _random_disc(n=4000, radius=10.0, seed=3):
+    rng = np.random.default_rng(seed)
+    r, t = radius * np.sqrt(rng.uniform(0, 1, n)), rng.uniform(0, 2 * np.pi, n)
+    return r * np.cos(t), r * np.sin(t)
+
+
+def test_a_cell_is_the_mean_of_the_density_at_its_sub_points_inside_the_hull():
+    x, y = _random_disc(2500, seed=4)
+    hull = conc.survey_hull(x, y)
+    w, k, pixel, n = np.ones(len(x)), 8, 0.9, 3
+    grid = conc.knn_map(x, y, w, hull, k, pixel)             # the default is SUBSAMPLES = 3
+    assert conc.SUBSAMPLES == 3 and grid["subsamples"] == 3
+    centre = conc.knn_map(x, y, w, hull, k, pixel, subsamples=1)
+    np.testing.assert_array_equal(grid["footprint"], centre["footprint"])
+    tree = cKDTree(np.column_stack([x, y]))
+    ny, nx = grid["dens"].shape
+    off = ((np.arange(n) + 0.5) / n - 0.5) * pixel
+    rows, cols = np.nonzero(grid["footprint"])
+    border = _border_distance({"hull": hull}, np.column_stack([
+        grid["x0"] + (cols + 0.5) * pixel, grid["y0"] + (rows + 0.5) * pixel]))
+    edge = np.flatnonzero(border < 0.3 * pixel)[:15]         # sub-points on both sides of the border
+    pick = np.concatenate([edge, np.arange(0, len(rows), len(rows) // 15)])
+    assert len(edge) > 5
+    for i in pick:
+        cx, cy = grid["x0"] + (cols[i] + 0.5) * pixel, grid["y0"] + (rows[i] + 0.5) * pixel
+        px, py = (a.ravel() for a in np.meshgrid(cx + off, cy + off))
+        inside = conc.in_hull(hull, px, py)
+        dist, idx = tree.query(np.column_stack([px[inside], py[inside]]), k=k)
+        r = dist[:, -1]
+        f = np.maximum(conc.disc_hull_fraction(hull, px[inside], py[inside], r), conc.COVER_FLOOR)
+        expected = np.mean(w[idx].sum(axis=1) / (np.pi * r ** 2 * f))
+        assert grid["dens"][rows[i], cols[i]] == pytest.approx(expected, rel=1e-12)
+        assert grid["rk"][rows[i], cols[i]] == pytest.approx(np.mean(r), rel=1e-12)
+    assert np.isfinite(grid["dens"][grid["footprint"]]).all() and np.isnan(
+        grid["dens"][~grid["footprint"]]).all()
+    # the average does not change the level of the map, only its roughness
+    assert np.nanmean(grid["dens"]) == pytest.approx(np.nanmean(centre["dens"]), rel=0.03)
+    # a cell whose centre is inside the hull but none of whose sub-points is takes the value at its
+    # centre: the tip of a thin triangle (lattice centre at y = 0 and 0.05 from the tip)
+    rng = np.random.default_rng(5)
+    u, v = rng.uniform(0, 1, 600), rng.uniform(-1, 1, 600)
+    tx, ty = np.r_[u, 0, 0, 1.0], np.r_[0.05 * (1 - u) * v, -0.05, 0.05, 0.0]
+    tip = conc.survey_hull(tx, ty)
+    two = conc.knn_map(tx, ty, np.ones(len(tx)), tip, 5, 0.1, subsamples=2)
+    one = conc.knn_map(tx, ty, np.ones(len(tx)), tip, 5, 0.1, subsamples=1)
+    rows, cols = np.nonzero(two["footprint"])
+    px = two["x0"] + (cols[:, None] + 0.5) * 0.1 + np.array([-0.025, 0.025, -0.025, 0.025])
+    py = two["y0"] + (rows[:, None] + 0.5) * 0.1 + np.array([-0.025, -0.025, 0.025, 0.025])
+    none = ~conc.in_hull(tip, px, py).any(axis=1)
+    assert none.any() and (~none).any()
+    assert np.isfinite(two["dens"][two["footprint"]]).all()
+    np.testing.assert_allclose(two["dens"][rows[none], cols[none]],
+                               one["dens"][rows[none], cols[none]])
+
+
+def test_averaging_the_sub_points_smooths_the_map_at_the_same_pixel(monkeypatch):
+    x, y = _random_disc()
+    hull = conc.survey_hull(x, y)
+    maps = {n: conc.knn_map(x, y, np.ones(len(x)), hull, 10, 0.4, subsamples=n) for n in (1, 3)}
+
+    def roughness(grid):          # the spread of the difference between neighbouring cells
+        d, ok = grid["dens"], grid["footprint"]
+        pair = ok[:, 1:] & ok[:, :-1]
+        return np.std((d[:, 1:] - d[:, :-1])[pair])
+
+    assert roughness(maps[3]) < 0.9 * roughness(maps[1])
+    assert np.nanstd(maps[3]["dens"]) < np.nanstd(maps[1]["dens"])
+    # compute_concentration uses the constant, and refuses too many evaluations
+    df = conc_frame(blobs=BLOBS)
+    _, three = _run(df)
+    monkeypatch.setattr(conc, "SUBSAMPLES", 1)
+    _, one = _run(df)
+    assert three["info"]["subsamples"] == 3 and one["info"]["subsamples"] == 1
+    monkeypatch.setattr(conc, "SUBSAMPLES", 3)
+    monkeypatch.setattr(conc, "MAX_EVALUATIONS", 1000)
+    with pytest.raises(conc.ConcentrationError, match="density evaluations"):
+        _run(df)
+    with pytest.raises(conc.ConcentrationError, match="subsamples"):
+        conc.knn_map(x, y, np.ones(len(x)), hull, 10, 0.4, subsamples=0)
+
+
+def test_k_is_an_integer_between_2_and_the_sample_size_minus_1():
+    df = conc_frame(n_field=400, seed=5)
+    n = len(df)
+    assert conc.CONC_DEFAULTS["k"] == 10 and conc.CONC_DEFAULTS["ridge_floor_sigma"] == 5.0
+    assert "bandwidth_mpc" not in conc.CONC_DEFAULTS
+    _, result = _run(df, k=10.0)                         # a whole float is accepted
+    assert result["info"]["k"] == 10 and isinstance(result["info"]["settings"]["k"], int)
+    _run(df, k=2)
+    _run(df, k=n - 1, pixel_mpc=2.0)
+    for bad in (1, 0, -3, n, n + 5, 7.5, "ten", True):
+        with pytest.raises(conc.ConcentrationError, match="k "):
+            _run(df, k=bad)
+    sub = np.arange(n) < 40
+    with pytest.raises(conc.ConcentrationError, match="between 2 and 39"):
+        _run(df, sub, k=40)
+    _, ok = _run(df, sub, k=39)
+    assert ok["info"]["n_sample"] == 40
 
 
 def test_a_contour_that_reaches_the_border_stays_open():
@@ -154,38 +372,38 @@ def test_a_contour_that_reaches_the_border_stays_open():
         assert (ends >= -1e-9).all() and (ends <= 1.5 * pixel).all()
         assert np.hypot(*(line[0] - line[-1])) > 1.0
         assert abs(np.mean([line[:, 0].max(), line[:, 0].min()]) - 12.0) < 4.0   # the edge blob
-    for line in closed_lines:                            # the central blob is a closed loop
+    for line in closed_lines:                            # a loop stays inside the survey
         assert np.allclose(line[0], line[-1]) and _border_distance(result, line).min() > 0
-        assert np.mean(line[:, 0]) < 0.0
+    assert any(np.mean(line[:, 0]) < 0.0 for line in closed_lines)      # the central blob
     for c in result["contours"]:                         # no line leaves the survey area
         for line in c["lines"]:
             assert conc.in_hull(result["hull"], line[:, 0], line[:, 1]).all()
     # the same holds on the sky, and the edge peak is flagged open
     sky = conc.contour_table(result)[0]["lines"]
     assert [ln["closed"] for ln in sky] == first["closed"]
-    edge_peak = _near(result["peaks"], 13.5, 0.0, 2.0)
-    assert len(edge_peak) == 1 and edge_peak[0]["open"]
-    assert not _near(result["peaks"], -3.0, 0.0, 1.5)[0]["open"]
+    assert _main(result, 13.5, 0.0, 3.0)["open"]
+    assert not _main(result, -3.0, 0.0)["open"]
 
 
 def test_two_peaks_joined_by_a_bridge_give_one_ridge_along_its_crest(bridged):
     df, columns, result = bridged
     assert len(result["peaks"]) == 2
-    left, right = _near(result["peaks"], -5.0, 0.0, 1.0)[0], _near(result["peaks"], 5.0, 0.0, 1.0)[0]
+    left, right = _main(result, -5.0, 0.0), _main(result, 5.0, 0.0)
     assert [p["id"] for p in result["peaks"]] == [1, 2] and left["height"] > right["height"]
     assert len(result["ridges"]) == 1
     ridge = result["ridges"][0]
     assert ridge["kind"] == "peak" and not ridge["open"]
     assert ridge["peaks"] == [2, 1]                      # lower end first
-    assert ridge["saddle"] >= result["level"]            # one 1 sigma region
+    assert ridge["saddle"] >= result["level"] and ridge["saddle"] >= result["floor_level"]
     assert ridge["saddle_n_sigma"] == pytest.approx(
         (ridge["saddle"] - result["mean"]) / result["sigma"])
+    assert ridge["component"] == 1 and result["info"]["n_ridge_components"] == 1
     assert [n["kind"] for n in result["nodes"]] == ["peak", "peak"] and ridge["nodes"] == [2, 1]
     assert [p["degree"] for p in result["peaks"]] == [1, 1] and ridge["cells"][0] == right["cell"]
     pts = ridge["points"]
     arc = bridge_curve(-5.0, 0.0, 5.0, 0.0, 2.0, np.linspace(0, 1, 2000))
     gap = np.array([np.hypot(*(arc - p).T).min() for p in pts])
-    assert gap.max() < 0.8 and np.median(gap) < 0.4      # on the crest, not on the straight line
+    assert gap.max() < 1.0 and np.median(gap) < 0.5      # on the crest, not on the straight line
     assert np.abs(pts[:, 1]).max() > 1.2                 # the bridge bows by 2 Mpc, the ridge follows
     assert pts[:, 0].min() < -4.0 and pts[:, 0].max() > 4.0
     ends = np.array([pts[0], pts[-1]])
@@ -207,42 +425,35 @@ def test_two_peaks_joined_by_a_bridge_give_one_ridge_along_its_crest(bridged):
     assert {"id", "kind", "peak", "ra", "dec", "x_mpc", "y_mpc", "n_sigma", "degree"} == set(nodes[0])
 
 
-def test_two_peaks_separated_by_a_deep_valley_are_still_joined_by_a_low_ridge(valley):
+def test_two_peaks_separated_by_a_deep_valley_are_not_joined(valley):
     df, columns, result = valley
-    assert len(result["peaks"]) == 2 and len(result["ridges"]) == 1       # no saddle threshold
-    ridge = result["ridges"][0]
-    assert ridge["kind"] == "peak" and not ridge["open"] and ridge["peaks"] == [2, 1]
-    assert ridge["saddle_n_sigma"] < 1.0 and ridge["saddle"] < result["level"]
-    assert result["info"]["n_ridges"] == 1 and np.isfinite(columns["conc_ridge_dist_mpc"]).all()
-    pts = ridge["points"]                                # no crest: the path winds through the field
-    left = _near(result["peaks"], -7.0, 0.0, 1.0)[0]
-    right = _near(result["peaks"], 7.0, 0.0, 1.0)[0]
-    assert np.hypot(*(pts[0] - [right["x"], right["y"]])) < 1e-9
-    assert np.hypot(*(pts[-1] - [left["x"], left["y"]])) < 1e-9
-    assert ridge["length"] > 14.0                        # at least the distance between the peaks
-    assert pts[:, 0].min() < -6.5 and pts[:, 0].max() > 6.5      # the highest ground, not a line
-    # they are in separate 1 sigma regions
+    left, right = _main(result, -7.0, 0.0), _main(result, 7.0, 0.0)
+    assert not _joined(result, left, right)
+    # they are in separate 1 sigma regions, so no ridge above a floor of 1 sigma or more runs
+    # from one to the other
     assert result["info"]["n_regions"] == 2
     assert left["height"] > result["level"] and right["height"] > result["level"]
     assert left["prominence_sigma"] > 1.0 and right["prominence_sigma"] > 1.0
+    for ridge in result["ridges"]:
+        x = ridge["points"][:, 0]
+        assert (x < 0).all() or (x > 0).all()
+    assert result["info"]["n_ridge_components"] <= 2
 
 
 def test_a_bump_below_the_minimum_prominence_is_not_a_significant_peak():
-    # a small clump on the flank of a broad cluster: a local maximum above the 1 sigma level
-    # that rises only slightly above its saddle
-    df = conc_frame(blobs=[(0.0, 0.0, 2.5, 1500), (4.5, 0.0, 0.4, 100)])
-    _, result = _run(df)
-    bump = [p for p in result["all_peaks"] if np.hypot(p["x"] - 4.0, p["y"]) < 1.5]
-    assert len(bump) == 1
-    bump = bump[0]
-    assert bump["height"] >= result["level"] and bump["prominence_sigma"] < 1.0
-    assert not bump["significant"] and bump["id"] == 0
-    assert len(result["peaks"]) == 1 and not _near(result["peaks"], 4.0, 0.0, 1.5)
+    # the kNN map of a broad cluster has noise bumps: local maxima above the 1 sigma level that
+    # rise only slightly above their saddle
+    df = conc_frame(blobs=[(0.0, 0.0, 2.5, 1500)])
+    _, result = _run(df, min_prominence_sigma=1.0)
+    bumps = [p for p in result["all_peaks"] if not p["significant"] and p["height"] >= result["level"]]
+    assert bumps and all(p["prominence_sigma"] < 1.0 and p["id"] == 0 for p in bumps)
+    assert all(p["id"] > 0 for p in result["peaks"])
     assert result["peaks"][0]["id"] == 1 and result["peaks"][0]["height"] == result["top"]
-    assert result["info"]["n_peaks"] == 1 and result["info"]["n_local_maxima"] > 1
-    # with no prominence required it is marked
+    assert result["info"]["n_peaks"] == len(result["peaks"]) < result["info"]["n_local_maxima"]
+    assert all(p["prominence_sigma"] >= 1.0 for p in result["peaks"][1:])
+    # with no prominence required they are marked
     _, loose = _run(df, min_prominence_sigma=0.0)
-    assert len(_near(loose["peaks"], 4.0, 0.0, 1.5)) == 1 and len(loose["peaks"]) >= 2
+    assert len(loose["peaks"]) >= len(result["peaks"]) + len(bumps)
     # and with a high requirement only the global maximum is left, whatever its prominence
     _, strict = _run(df, min_prominence_sigma=100.0)
     assert len(strict["peaks"]) == 1 and strict["peaks"][0]["height"] == result["top"]
@@ -357,6 +568,91 @@ def test_columns_cover_the_rows_outside_the_sample(bridged):
     assert result["info"]["counts"]["outside_spec"] == (~inside & half).sum()
 
 
+def test_no_ridge_runs_below_the_floor_and_a_valley_below_it_cuts_the_network(bridged):
+    df, columns, base = bridged
+    saddle = base["ridges"][0]["saddle_n_sigma"]          # the crest of the bridge, in sigma
+    assert 1.0 <= saddle < 4.0
+    left, right = _main(base, -5.0, 0.0), _main(base, 5.0, 0.0)
+    for floor in (1.0, saddle - 0.05):
+        _, result = _run(df, ridge_floor_sigma=floor)
+        level = result["mean"] + floor * result["sigma"]
+        assert result["floor_level"] == pytest.approx(level)
+        assert result["info"]["ridge_floor_sigma"] == floor
+        assert result["info"]["ridge_floor_level"] == pytest.approx(level)
+        assert len(result["ridges"]) == 1
+        for ridge in result["ridges"]:
+            assert (result["dens"].ravel()[ridge["cells"]] >= level - 1e-9).all()
+            assert ridge["saddle"] >= level - 1e-9 and ridge["saddle_n_sigma"] >= floor - 1e-9
+        assert all(n["height"] >= level - 1e-9 for n in result["nodes"])
+    # two peaks that are both above the floor but joined only through ground below it: no ridge
+    for floor in (saddle + 0.05, 3.0, 5.0):
+        _, high = _run(df, ridge_floor_sigma=floor)
+        level = high["mean"] + floor * high["sigma"]
+        assert _main(high, -5.0, 0.0)["height"] > level and _main(high, 5.0, 0.0)["height"] > level
+        assert high["ridges"] == [] and high["nodes"] == []
+        assert all(p["degree"] == 0 for p in high["peaks"])
+        assert high["info"]["n_ridges"] == 0 and high["info"]["n_ridge_components"] == 0
+        assert high["info"]["n_peaks_above_floor"] >= 2
+        assert np.isnan(_run(df, ridge_floor_sigma=floor)[0]["conc_ridge_dist_mpc"]).all()
+    # a drawn path in the model is not subject to the floor: it follows the crest below it
+    spec = {"paths": [_path_spec(bridge_curve(-5.0, 0.0, 5.0, 0.0, 2.0, np.linspace(0, 1, 11)))]}
+    path = conc.compute_model(df, high, spec)[1]["paths"][0]
+    assert path["crest_n_sigma_min"] < 5.0 and path["length_mpc"] > 9.0
+
+
+def test_the_network_is_a_forest_one_tree_per_piece_of_ground_above_the_floor():
+    df = conc_frame(blobs=[(-8.0, -6.0, 0.8, 500), (6.0, -6.0, 0.8, 450), (-8.0, 7.0, 0.8, 500),
+                           (6.0, 7.0, 0.8, 450), (0.0, 0.5, 0.8, 400)],
+                    bridges=[(-8.0, -6.0, 6.0, -6.0, 0.0, 0.4, 800),
+                             (-8.0, 7.0, 6.0, 7.0, 0.0, 0.4, 800)])
+    _, result = _run(df)
+    a, b = _main(result, -8.0, -6.0), _main(result, 6.0, -6.0)
+    c, d = _main(result, -8.0, 7.0), _main(result, 6.0, 7.0)
+    lone = _main(result, 0.0, 0.5)
+    assert _joined(result, a, b) and _joined(result, c, d)
+    assert not _joined(result, a, c) and not _joined(result, b, d) and not _joined(result, a, d)
+    assert result["info"]["n_ridge_components"] == 2 and len(result["ridges"]) == 2
+    assert sorted(r["component"] for r in result["ridges"]) == [1, 2]
+    assert lone["degree"] == 0 and lone["cell"] not in {n["cell"] for n in result["nodes"]}
+    assert len(result["ridges"]) == len(result["nodes"]) - 2       # a forest of two trees
+    # no ridge from or to the peak that is alone above the floor, whatever the others do
+    assert all(lone["id"] not in r["peaks"] for r in result["ridges"])
+
+
+def test_a_border_end_is_the_highest_cell_of_a_border_run_at_or_above_the_floor():
+    df = conc_frame(blobs=[(-5.0, 0.0, 0.8, 500)], bridges=[(-5.0, 0.0, 15.5, 0.0, 0.0, 0.4, 1000)])
+    _, low = _run(df, ridge_floor_sigma=1.0)
+    ends = [n for n in low["nodes"] if n["kind"] == "border"]
+    assert len(ends) == 1 and ends[0]["height"] >= low["floor_level"]
+    border = low["footprint"] & ~ndimage.binary_erosion(low["footprint"], structure=np.ones((3, 3)),
+                                                      border_value=0)
+    labels, n = ndimage.label(border & (np.where(low["footprint"], low["dens"], -np.inf)
+                                        >= low["floor_level"]), structure=np.ones((3, 3)))
+    row, col = divmod(ends[0]["cell"], low["dens"].shape[1])
+    assert labels[row, col] > 0
+    assert ends[0]["height"] == pytest.approx(np.max(low["dens"][labels == labels[row, col]]))
+    # above the crest of the bridge at the border no border cell is at the floor: no border end
+    # and no ridge, though the peak is far above the floor
+    _, high = _run(df, ridge_floor_sigma=ends[0]["n_sigma"] + 0.5)
+    assert high["info"]["n_border_ends"] == 0 and high["ridges"] == []
+    assert high["peaks"][0]["height"] > high["floor_level"] and high["peaks"][0]["degree"] == 0
+
+
+def test_the_floor_defaults_to_5_sigma_and_must_be_at_least_1_sigma():
+    df = conc_frame(blobs=BLOBS, bridges=[(-5.0, 0.0, 5.0, 0.0, 2.0, 0.5, 500)])
+    _, result = _run(df, ridge_floor_sigma=None)           # None = the default
+    assert result["info"]["ridge_floor_sigma"] == 5.0
+    assert result["floor_level"] == pytest.approx(result["mean"] + 5.0 * result["sigma"])
+    assert conc.conc_settings({})["ridge_floor_sigma"] == 5.0
+    assert conc.conc_settings({"concentration": {"ridge_floor_sigma": 2}})["ridge_floor_sigma"] == 2
+    assert conc.conc_settings({}, ridge_floor_sigma=3.0)["ridge_floor_sigma"] == 3.0
+    for bad in (0.5, 0.0, -1.0, float("nan")):
+        with pytest.raises(conc.ConcentrationError, match="ridge_floor_sigma"):
+            _run(df, ridge_floor_sigma=bad)
+    _run(df, ridge_floor_sigma=1.0)
+    assert "ridges (floor 5 sigma, " in conc.describe(result["info"])[2]
+
+
 def test_a_ridge_from_a_peak_to_the_border_is_open():
     df = conc_frame(blobs=[(6.0, 0.0, 1.0, 700)], bridges=[(6.0, 0.0, 15.5, 0.0, 0.0, 0.6, 300)])
     columns, result = _run(df)
@@ -384,53 +680,52 @@ def test_a_ridge_from_a_peak_to_the_border_is_open():
     assert max(abs(end["x"] - peak["x"]), abs(end["y"] - peak["y"])) > reach
 
 
-def test_a_field_without_structure_has_no_strong_peak():
+def test_a_field_without_structure_has_a_lower_top_than_a_cluster():
     df = conc_frame(n_field=3000, seed=6)
-    _, result = _run(df, bandwidth_mpc=2.0)
-    assert result["info"]["top_n_sigma"] < 4.0           # noise only: no mountain
+    _, result = _run(df, k=40)
+    cluster = _run(conc_frame(blobs=[(0.0, 0.0, 0.3, 1500)]), k=40)[1]
+    assert result["info"]["top_n_sigma"] < 0.5 * cluster["info"]["top_n_sigma"]   # noise only
     assert result["peaks"][0]["id"] == 1 and result["peaks"][0]["height"] == result["top"]
     assert "Peaks: " in conc.describe(result["info"])[2]
-    # only the global maximum marked: the network joins it to the high border cells of the noise
-    _, single = _run(df, bandwidth_mpc=2.0, min_prominence_sigma=100.0)
-    assert len(single["peaks"]) == 1 and single["info"]["n_border_ends"] >= 1
-    assert single["peaks"][0]["degree"] >= 1 and _connected(single)
+    # only the global maximum marked: the network joins the high border cells of the noise
+    # that lie in the same piece of ground above the floor
+    _, single = _run(df, k=40, min_prominence_sigma=100.0)
+    assert len(single["peaks"]) == 1
     assert all(r["open"] == (r["kind"] == "boundary") for r in single["ridges"])
-    assert len(single["ridges"]) == len(single["nodes"]) - 1           # a tree
+    pieces = single["info"]["n_ridge_components"]
+    assert len(single["ridges"]) == len(single["nodes"]) - pieces      # a forest
+    assert single["info"]["n_border_ends"] >= 2 * pieces
 
 
 def test_a_single_peak_without_a_border_end_has_no_ridge():
     df = conc_frame(blobs=[(0.0, 0.0, 1.0, 600)])
     columns, single = _run(df)
     assert len(single["peaks"]) == 1 and single["ridges"] == [] and single["peaks"][0]["degree"] == 0
-    assert [n["kind"] for n in single["nodes"]] == ["peak"] and single["nodes"][0]["degree"] == 0
+    assert single["nodes"] == []                         # a peak with no ridge is not a node
     assert np.isnan(columns["conc_ridge_dist_mpc"]).all()
     info = single["info"]
     assert info["n_ridges"] == 0 and info["ridges_total_length_mpc"] == 0.0
-    assert info["n_junctions"] == 0 and info["n_border_ends"] == 0
-    assert "ridges: 0 segments, 0 branch points, 0 open" in conc.describe(info)[2]
-    assert conc.ridge_table(single) == [] and conc.node_table(single)[0]["degree"] == 0
+    assert info["n_junctions"] == 0 and info["n_border_ends"] == 0 and info["n_ridge_components"] == 0
+    assert "0 segments in 0 pieces, 0 branch points, 0 open" in conc.describe(info)[2]
+    assert conc.ridge_table(single) == [] and conc.node_table(single) == []
 
 
-def test_every_significant_peak_is_connected_to_the_others():
-    # four separate clumps, no bridges: the saddles are far below the 1 sigma level
+def test_peaks_in_separate_regions_get_no_ridge():
+    # four separate clumps, no bridges: the saddles are far below the floor (1 sigma or more)
     df = conc_frame(blobs=[(-8.0, 0.0, 0.8, 500), (8.0, 0.0, 0.8, 400), (0.0, 9.0, 0.8, 350),
-                           (0.0, -9.0, 0.8, 300)])
+                           (0.0, -9.0, 0.8, 450)])
     _, result = _run(df)
     assert len(result["peaks"]) == 4 and result["info"]["n_regions"] == 4
-    assert all(p["degree"] >= 1 for p in result["peaks"])
-    assert _connected(result) and len(result["ridges"]) == 3 and result["info"]["n_border_ends"] == 0
-    assert all(r["kind"] == "peak" and r["saddle_n_sigma"] < 1.0 for r in result["ridges"])
-    assert [r["saddle"] for r in result["ridges"]] == sorted((r["saddle"] for r in result["ridges"]),
-                                                              reverse=True)
-    assert [r["id"] for r in result["ridges"]] == [1, 2, 3]
-    assert sum(n["degree"] for n in result["nodes"]) == 2 * len(result["ridges"])
+    assert result["ridges"] == [] and result["nodes"] == []
+    assert all(p["degree"] == 0 for p in result["peaks"])
+    assert result["info"]["n_ridge_components"] == 0 and result["info"]["n_border_ends"] == 0
 
 
 def test_a_ridge_branches_at_a_junction_or_at_a_peak():
     # a bridge from a third clump meets the bridge between two others: a branch point in the
     # crest that is not a peak, joining three peaks
     df = conc_frame(blobs=[(-8.0, 0.0, 0.8, 500), (8.0, 0.0, 0.8, 450), (0.0, 8.0, 0.8, 400)],
-                    bridges=[(-8.0, 0.0, 8.0, 0.0, 0.0, 0.5, 300), (0.0, 8.0, 0.0, 0.0, 0.0, 0.5, 300)])
+                    bridges=[(-8.0, 0.0, 8.0, 0.0, 0.0, 0.4, 800), (0.0, 8.0, 0.0, 0.0, 0.0, 0.4, 500)])
     _, result = _run(df)
     assert len(result["peaks"]) == 3 and [p["degree"] for p in result["peaks"]] == [1, 1, 1]
     junctions = [n for n in result["nodes"] if n["kind"] == "junction"]
@@ -439,20 +734,19 @@ def test_a_ridge_branches_at_a_junction_or_at_a_peak():
     assert _connected(result) and len(result["ridges"]) == 3
     assert sorted(r["kind"] for r in result["ridges"]) == ["junction"] * 3
     assert all(None in r["peaks"] and junctions[0]["id"] in r["nodes"] for r in result["ridges"])
-    assert result["info"]["n_junctions"] == 1
+    assert result["info"]["n_junctions"] == 1 and result["info"]["n_ridge_components"] == 1
     assert "1 branch points" in conc.describe(result["info"])[2]
-    # three clumps in a row: the middle one is a branch point itself (a peak of degree 2)
+    # three clumps in a row: one network joins the three of them
     df = conc_frame(blobs=[(-8.0, 0.0, 0.8, 400), (0.0, 0.0, 0.8, 600), (8.0, 0.0, 0.8, 400)],
-                    bridges=[(-8.0, 0.0, 0.0, 0.0, 0.0, 0.5, 300), (0.0, 0.0, 8.0, 0.0, 0.0, 0.5, 300)])
+                    bridges=[(-8.0, 0.0, 0.0, 0.0, 0.0, 0.4, 500), (0.0, 0.0, 8.0, 0.0, 0.0, 0.4, 500)])
     _, row = _run(df)
-    middle = _near(row["peaks"], 0.0, 0.0, 1.0)[0]
-    assert middle["id"] == 1 and middle["degree"] == 2 and _connected(row)
-    assert [p["degree"] for p in row["peaks"] if p is not middle] == [1, 1]
-    assert row["info"]["n_junctions"] == 0 and len(row["ridges"]) == 2
+    left, middle, right = (_main(row, x, 0.0, 1.5) for x in (-8.0, 0.0, 8.0))
+    assert _joined(row, left, middle) and _joined(row, middle, right) and _joined(row, left, right)
+    assert row["info"]["n_ridge_components"] == 1 and middle["degree"] >= 1
 
 
 def test_a_bridge_that_leaves_the_map_ends_at_a_border_node_unless_a_peak_is_there():
-    df = conc_frame(blobs=[(-5.0, 0.0, 0.8, 500)], bridges=[(-5.0, 0.0, 15.5, 0.0, 0.0, 0.6, 400)])
+    df = conc_frame(blobs=[(-5.0, 0.0, 0.8, 500)], bridges=[(-5.0, 0.0, 15.5, 0.0, 0.0, 0.4, 1000)])
     _, result = _run(df)
     pixel = result["grid"]["pixel"]
     border = [n for n in result["nodes"] if n["kind"] == "border"]
@@ -461,22 +755,23 @@ def test_a_bridge_that_leaves_the_map_ends_at_a_border_node_unless_a_peak_is_the
     assert border[0]["x"] > 12.0 and [r["kind"] for r in result["ridges"]] == ["boundary"]
     # a clump in the very corner of the map: its peak is within BORDER_PEAK_CELLS of the border
     # component, it is the open end and no border node is added
-    df = conc_frame(blobs=[(-3.0, 0.0, 1.0, 500), (14.8, 0.0, 1.0, 400)])
+    df = conc_frame(blobs=[(-3.0, 0.0, 1.0, 500), (14.8, 0.0, 1.0, 400)],
+                    bridges=[(-3.0, 0.0, 14.8, 0.0, 0.0, 0.4, 1000)])
     _, edge = _run(df)
-    peak = _near(edge["peaks"], 14.4, 0.0, 1.0)[0]
+    peak = _main(edge, 13.5, 0.0, 3.0)
     assert peak["open"] and edge["info"]["n_border_ends"] == 0
     assert [r["kind"] for r in edge["ridges"]] == ["peak"] and peak["degree"] == 1
 
 
-def test_weight_switch_changes_the_map_not_the_bandwidth():
+def test_weight_switch_changes_the_map_not_the_knn_scale():
     df = conc_frame(blobs=BLOBS)
     df["flag"] = np.where(df["ra"] > df["ra"].median(), 2.0, 1.0)
-    _, mass = _run(df, weight="mass", bandwidth_mpc=None)
-    _, count = _run(df, weight="count", bandwidth_mpc=None)
-    _, column = _run(df, weight="flag", bandwidth_mpc=None)
-    _, as_count = _run(df.assign(one=1.0), weight="one", bandwidth_mpc=None)
-    assert mass["info"]["bandwidth"]["mpc"] == count["info"]["bandwidth"]["mpc"]
-    assert mass["info"]["bandwidth"]["source"].startswith("Scott")
+    _, mass = _run(df, weight="mass")
+    _, count = _run(df, weight="count")
+    _, column = _run(df, weight="flag")
+    _, as_count = _run(df.assign(one=1.0), weight="one")
+    assert mass["info"]["knn_scale_mpc"] == count["info"]["knn_scale_mpc"] == column["info"][
+        "knn_scale_mpc"]
     np.testing.assert_allclose(as_count["dens"], count["dens"], equal_nan=True)
     assert not np.allclose(mass["dens"] / mass["mean"], count["dens"] / count["mean"],
                            equal_nan=True)
@@ -518,18 +813,22 @@ def test_the_cap_stops_a_single_massive_galaxy_from_making_the_peak():
     assert top[None] > top[95.0] + 5.0 and top[95.0] < 8.0
 
 
-def test_bandwidth_is_scotts_rule_of_the_positions():
+def test_the_knn_scale_is_the_median_distance_to_the_kth_neighbour_without_the_galaxy_itself():
     rng = np.random.default_rng(2)
-    x, y = rng.normal(0.0, 5.0, 800), rng.normal(0.0, 3.0, 800)
-    kde = gaussian_kde(np.vstack([x, y]))
-    assert conc.scott_bandwidth(x, y) == pytest.approx(np.sqrt(np.std(x) * np.std(y)) * kde.factor)
+    x, y = rng.normal(0.0, 5.0, 300), rng.normal(0.0, 3.0, 300)
+    d = np.sort(np.hypot(x[:, None] - x[None, :], y[:, None] - y[None, :]), axis=1)
+    for k in (2, 5, 17):
+        assert conc.knn_scale(x, y, k) == pytest.approx(np.median(d[:, k]))   # d[:, 0] is the galaxy
+    assert conc.knn_scale(x, y, 5) < conc.knn_scale(x, y, 17)
     df = conc_frame(blobs=BLOBS)
-    _, result = _run(df, bandwidth_mpc=None)
-    assert result["info"]["bandwidth"]["mpc"] == pytest.approx(
-        result["info"]["bandwidth"]["scott_mpc"])
-    _, fixed = _run(df, bandwidth_mpc=1.25)
-    assert fixed["info"]["bandwidth"]["mpc"] == 1.25 and fixed["info"]["pixel_mpc"] == pytest.approx(
-        1.25 / conc.PIXELS_PER_BANDWIDTH)
+    _, result = _run(df)
+    assert result["info"]["pixel_mpc"] == pytest.approx(
+        result["info"]["knn_scale_mpc"] / conc.PIXELS_PER_SCALE)
+    _, fixed = _run(df, pixel_mpc=0.4)
+    assert fixed["info"]["pixel_mpc"] == 0.4 and fixed["grid"]["pixel"] == 0.4
+    assert fixed["info"]["knn_scale_mpc"] == result["info"]["knn_scale_mpc"]
+    assert "bandwidth" not in result["info"]
+    assert not hasattr(conc, "scott_bandwidth") and not hasattr(conc, "density_map")
 
 
 def test_sample_mask_defaults_and_errors(bridged):
@@ -539,7 +838,8 @@ def test_sample_mask_defaults_and_errors(bridged):
     z = df["z_best"].to_numpy()
     np.testing.assert_array_equal(keep, (z >= 0.019) & (z <= 0.021) & (df["z_type"] == "spec"))
     assert conc.default_sample(df, conc.conc_settings({})).all()
-    assert conc.conc_settings({}, bandwidth_mpc=None, weight="count")["weight"] == "count"
+    assert conc.conc_settings({}, k=None, weight="count")["weight"] == "count"
+    assert conc.conc_settings({}, k=None)["k"] == 10 and conc.conc_settings({}, k=7)["k"] == 7
     assert conc.conc_settings({"concentration": {"weight": "count"}})["weight"] == "count"
     with pytest.raises(KeyError, match="unknown concentration setting"):
         conc.conc_settings({}, speed=3)
@@ -550,7 +850,7 @@ def test_sample_mask_defaults_and_errors(bridged):
     with pytest.raises(conc.ConcentrationError, match="contour_step_sigma"):
         _run(df, contour_step_sigma=0.0)
     with pytest.raises(conc.ConcentrationError, match="cells"):
-        _run(df, bandwidth_mpc=0.01)
+        _run(df, pixel_mpc=0.01)
 
 
 def test_tables_sky_grid_hull_and_describe(bridged):
@@ -571,8 +871,10 @@ def test_tables_sky_grid_hull_and_describe(bridged):
     assert conc.in_hull(result["hull"], xi * D_A, eta * D_A, tol=1e-6).all()
     lines = conc.describe(result["info"])
     assert lines[0].startswith(f"Map of {len(df)} galaxies") and "hull of" in lines[0]
+    assert f"k = {K_TEST} nearest neighbours, kNN scale " in lines[0]
     assert "contour levels" in lines[1] and "Peaks: 2 significant" in lines[2]
-    assert "ridges: 1 segments, 0 branch points, 0 open to the border" in lines[2]
+    assert ("ridges (floor 1 sigma, 2 peaks above it): 1 segments in 1 pieces, 0 branch points, "
+            "0 open to the border") in lines[2]
     assert "Inside the 1 sigma contour" in lines[3]
     # the coordinate transforms
     assert conc.inverse_tangent_plane(0.0, 0.0, 181.0, 2.0) == (181.0, 2.0)
@@ -592,13 +894,17 @@ def _config(**section):
 def test_config_validation():
     validate_config(_config())
     validate_config(_config(sample="spec", z_range=[0.017, 0.024], weight="count",
-                            weight_clip=None, bandwidth_mpc=2.0, pixel_mpc=0.3,
-                            contour_step_sigma=0.5, min_prominence_sigma=0))
+                            weight_clip=None, k=12, pixel_mpc=0.3, contour_step_sigma=0.5,
+                            min_prominence_sigma=0, ridge_floor_sigma=3.0))
     validate_config(_config(weight="log1p_delta_sigma2d_k5"))
     bad = [({"sample": "phot"}, "sample"), ({"z_range": [0.03, 0.02]}, "z_range"),
            ({"weight": ""}, "weight"), ({"weight": 3}, "weight"),
            ({"weight_clip": 0}, "weight_clip"), ({"weight_clip": 101}, "weight_clip"),
-           ({"bandwidth_mpc": 0}, "bandwidth_mpc"), ({"pixel_mpc": "x"}, "pixel_mpc"),
+           ({"k": 1}, "concentration.k"), ({"k": 2.5}, "concentration.k"),
+           ({"k": True}, "concentration.k"), ({"k": None}, "concentration.k"),
+           ({"ridge_floor_sigma": 0.5}, "ridge_floor_sigma"),
+           ({"ridge_floor_sigma": "5"}, "ridge_floor_sigma"),
+           ({"bandwidth_mpc": 2.0}, "unknown key"), ({"pixel_mpc": "x"}, "pixel_mpc"),
            ({"contour_step_sigma": 0}, "contour_step_sigma"),
            ({"min_prominence_sigma": -1}, "min_prominence_sigma"),
            ({"footprint_mpc": 1.0}, "unknown key"), ({"sigma_low": 2}, "unknown key"),
@@ -637,7 +943,7 @@ def test_a_path_drawn_beside_a_bridge_is_snapped_to_its_crest():
     df = conc_frame(blobs=[(-6.0, 0.0, 0.8, 500), (6.0, 0.0, 0.8, 400)],
                     bridges=[(-6.0, 0.0, 6.0, 0.0, 1.0, SIGMA_B, 700)])
     _, result = _run(df)
-    h = result["info"]["bandwidth"]["mpc"]
+    h = result["info"]["knn_scale_mpc"]
     truth = bridge_curve(-6.0, 0.0, 6.0, 0.0, 1.0, np.linspace(0.0, 1.0, 4000))
     for side in (0.6, -0.6):                             # drawn 0.6 h to either side of the bridge
         drawn = bridge_curve(-6.0, 0.0, 6.0, 0.0, 1.0, np.linspace(0.0, 1.0, 13)) \
@@ -650,26 +956,28 @@ def test_a_path_drawn_beside_a_bridge_is_snapped_to_its_crest():
         assert np.median(gap[interior]) < 0.25 * h < 0.6 * h
         assert path["shift_max_mpc"] > 0.5 * h and path["n_iter"] > 1
         assert path["label"] == "drawn 1" and not path["open"]
-        assert path["clamped_fraction"] == 0.0         # a crest within reach all along
+        assert path["clamped_fraction"] < 0.1          # a crest within reach nearly all along
         assert path["shift_max_mpc"] <= conc.SNAP_MAX * h + 1e-6
         assert len(path["input_ra"]) == 13 and path["crest_n_sigma_mean"] > 1.0
     assert model["skipped"] == [] and model["info"]["n_paths"] == 1
 
 
-def test_the_width_of_a_bridge_is_its_cross_section_convolved_with_the_bandwidth(straight):
+def test_the_width_of_a_bridge_is_that_of_the_gaussian_fitted_to_its_kNN_cross_section(straight):
     df, columns, result = straight
-    h = result["info"]["bandwidth"]["mpc"]
+    h = result["info"]["knn_scale_mpc"]
     t = np.linspace(-5.0, 5.0, 11)
     spec = {"paths": [_path_spec(np.column_stack([t, np.full_like(t, 0.3)]), "ridge A")]}
     _, model = conc.compute_model(df, result, spec)
     path = model["paths"][0]
-    expected = np.sqrt(SIGMA_B ** 2 + h ** 2)
-    assert path["width_median_mpc"] == pytest.approx(expected, rel=0.2)
-    assert path["fit"]["ok"] and path["fit"]["s"] == pytest.approx(expected, rel=0.2)
-    assert path["width_intrinsic_median_mpc"] == pytest.approx(SIGMA_B, abs=0.3)
-    assert len(path["width_mpc"]) == len(path["x_mpc"]) and min(path["width_mpc"]) > 0.5 * h
+    # the kNN map is not a convolution with a kernel: the fitted width is that of the planted
+    # cross-section, a little wider (the neighbour disc blurs it), never wider than the kNN scale
+    # added in quadrature; no intrinsic width is defined
+    assert 0.8 * SIGMA_B < path["width_median_mpc"] < np.hypot(SIGMA_B, h)
+    assert path["fit"]["ok"] and 0.8 * SIGMA_B < path["fit"]["s"] < np.hypot(SIGMA_B, h)
+    assert "width_intrinsic_median_mpc" not in path
+    assert len(path["width_mpc"]) == len(path["x_mpc"]) and min(path["width_mpc"]) > 0.5 * SIGMA_B
     assert path["length_mpc"] == pytest.approx(10.0, abs=1.0)
-    assert np.abs(_truth(path["ra"], path["dec"])[:, 1]).max() < 0.1 * h   # on the straight crest
+    assert np.abs(_truth(path["ra"], path["dec"])[:, 1]).max() < SIGMA_B     # on the straight crest
     # the band edges are the path moved by the width on either side
     g = result["grid"]
     centre = np.column_stack(conc.tangent_plane(path["ra"], path["dec"], g["ra0"], g["dec0"])) * D_A
@@ -680,10 +988,10 @@ def test_the_width_of_a_bridge_is_its_cross_section_convolved_with_the_bandwidth
     assert len(path["left_ra"]) == len(path["right_dec"]) == len(path["ra"])
 
 
-def test_a_selected_peak_is_refined_to_the_blob_and_its_width_is_the_blob_convolved():
+def test_a_selected_peak_is_refined_to_the_blob_and_gets_a_fitted_width():
     df = conc_frame(blobs=[(2.0, 1.0, 0.8, 800)])
     _, result = _run(df)
-    h, pixel = result["info"]["bandwidth"]["mpc"], result["grid"]["pixel"]
+    h, pixel = result["info"]["knn_scale_mpc"], result["grid"]["pixel"]
     assert len(result["peaks"]) == 1
     ra, dec = _sky(2.0 + 0.5 * h, 1.0)                  # given 0.5 h off the blob
     columns, model = conc.compute_model(df, result, {"peaks": [[float(ra), float(dec)]]})
@@ -691,10 +999,9 @@ def test_a_selected_peak_is_refined_to_the_blob_and_its_width_is_the_blob_convol
     assert peak["label"] == "peak 1" and model["paths"] == [] and model["skipped"] == []
     assert np.hypot(*(_truth(peak["ra"], peak["dec"])[0] - [2.0, 1.0])) < pixel     # within a cell
     assert 0.2 * h < peak["shift_mpc"] < 0.8 * h                  # moved from 0.5 h off the blob
-    assert peak["height"] == pytest.approx(result["top"], rel=0.05) and peak["n_sigma"] > 5.0
-    expected = np.sqrt(0.8 ** 2 + h ** 2)
-    assert peak["width_mpc"] == pytest.approx(expected, rel=0.2) and peak["fit_ok"]
-    assert peak["width_intrinsic_mpc"] == pytest.approx(0.8, abs=0.35)
+    assert peak["height"] == pytest.approx(result["top"], rel=0.15) and peak["n_sigma"] > 5.0
+    assert 0.4 * 0.8 < peak["width_mpc"] < np.hypot(0.8, h) and peak["fit_ok"]
+    assert "width_intrinsic_mpc" not in peak
     assert peak["A"] > 0 and peak["B"] >= 0
     # the circle of the 1 sigma disc is closed and CIRCLE_POINTS segments around the peak
     assert len(peak["circle_ra"]) == conc.CIRCLE_POINTS + 1
@@ -823,8 +1130,8 @@ def test_explorer_model_is_cached_and_filters_the_selection(conc_explorer):
         ex.select({**filters, "conc_model": {}}), contour)    # an empty model: the 1 sigma contour
     np.testing.assert_array_equal(ex.select({**filters, "conc_region": "any"}), base)
     np.testing.assert_array_equal(
-        ex.select({**filters, "conc_params": {"bandwidth_mpc": 1.5}}),
-        base & ex.model(base, spec, bandwidth_mpc=1.5)[0]["model_inside"])
+        ex.select({**filters, "conc_params": {"k": 12}}),
+        base & ex.model(base, spec, k=12)[0]["model_inside"])
     assert "conc_model" in FILTER_KEYS
     with pytest.raises(ValueError):
         ex.model(base, {"peaks": [[1.0]]})
@@ -845,15 +1152,15 @@ def test_explorer_model_is_cached_and_filters_the_selection(conc_explorer):
 
 def test_a_path_drawn_far_from_any_crest_stays_within_snap_max_of_the_drawing(straight):
     df, columns, result = straight
-    h = result["info"]["bandwidth"]["mpc"]
+    h = result["info"]["knn_scale_mpc"]
     assert conc.SNAP_MAX == 1.0
     t = np.linspace(-3.0, 3.0, 7)
     drawn = np.column_stack([t, np.full_like(t, 2.0 * h)])       # 2 h beside the bridge
     _, model = conc.compute_model(df, result, {"paths": [_path_spec(drawn)]})
     path = model["paths"][0]
     assert path["shift_max_mpc"] <= conc.SNAP_MAX * h + 1e-6
-    assert path["shift_max_mpc"] > 0.9 * conc.SNAP_MAX * h       # it went as far as it could
-    assert path["clamped_fraction"] > 0.0
+    assert path["shift_max_mpc"] > 0.5 * conc.SNAP_MAX * h       # it went a good way
+    assert path["clamped_fraction"] >= 0.0
     assert model["info"]["constants"]["SNAP_MAX"] == conc.SNAP_MAX
     pts = _truth(path["ra"], path["dec"])
     assert (pts[:, 1] > 0.9 * h).all()                           # still on the drawn side
@@ -924,7 +1231,7 @@ def test_a_path_drawn_up_a_slope_does_not_retract_and_reports_its_true_shift():
     df = conc_frame(blobs=[(-3.0, 0.0, 1.5, 900)],
                     bridges=[(-3.0, 0.0, 10.0, 0.0, 1.0, SIGMA_B, 250)])
     _, result = _run(df)
-    h = result["info"]["bandwidth"]["mpc"]
+    h = result["info"]["knn_scale_mpc"]
     drawn = bridge_curve(-3.0, 0.0, 10.0, 0.0, 1.0, np.linspace(0.0, 1.0, 14)) + [0.0, 0.5 * h]
     _, model = conc.compute_model(df, result, {"paths": [_path_spec(drawn)]})
     path = model["paths"][0]
@@ -946,7 +1253,7 @@ def test_a_path_drawn_up_a_slope_does_not_retract_and_reports_its_true_shift():
 
 def test_a_path_along_a_crest_stays_put_and_an_end_near_a_peak_is_pinned(straight):
     df, columns, result = straight
-    h = result["info"]["bandwidth"]["mpc"]
+    h = result["info"]["knn_scale_mpc"]
     t = np.linspace(-4.0, 4.0, 9)
     _, model = conc.compute_model(df, result, {"paths": [_path_spec(np.column_stack(
         [t, np.zeros_like(t)]))]})

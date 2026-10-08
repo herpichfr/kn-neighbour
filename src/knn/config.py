@@ -222,9 +222,14 @@ def _validate_concentration(sec, cfg):
     clip = sec.get("weight_clip", CONC_DEFAULTS["weight_clip"])
     if clip is not None and (not _is_number(clip) or not 0 < clip <= 100):
         raise ConfigError("'concentration.weight_clip' must be null or a percentile in (0, 100]")
-    for key in ("bandwidth_mpc", "pixel_mpc"):
-        if sec.get(key) is not None and (not _is_number(sec[key]) or sec[key] <= 0):
-            raise ConfigError(f"'concentration.{key}' must be a number > 0 or null")
+    if sec.get("pixel_mpc") is not None and (not _is_number(sec["pixel_mpc"])
+                                              or sec["pixel_mpc"] <= 0):
+        raise ConfigError("'concentration.pixel_mpc' must be a number > 0 or null")
+    if "k" in sec and (not _is_int(sec["k"]) or sec["k"] < 2):
+        raise ConfigError("'concentration.k' must be an integer >= 2")
+    if "ridge_floor_sigma" in sec and (not _is_number(sec["ridge_floor_sigma"])
+                                        or sec["ridge_floor_sigma"] < 1):
+        raise ConfigError("'concentration.ridge_floor_sigma' must be a number >= 1")
     if "contour_step_sigma" in sec and (not _is_number(sec["contour_step_sigma"])
                                         or sec["contour_step_sigma"] <= 0):
         raise ConfigError("'concentration.contour_step_sigma' must be a number > 0")

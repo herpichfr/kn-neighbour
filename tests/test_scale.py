@@ -41,14 +41,13 @@ def test_views_at_1e5(big):
     sample, t_sample = _timed(cb.sample_info, big, state)
     env, t_env = _timed(cb.env_info, big, state)
     sky, t_sky = _timed(cb.sky_callback, big, state, env, sample)
-    f3, t_3d = _timed(cb.scatter3d_callback, big, state, env, sample, list(range(0, N, 50)))
     out, t_an = _timed(cb.analysis_callback, big, state, env, sample)
     csv, t_csv = _timed(cb.export_csv_frame, big, state, env, sample)
     pdf, t_pdf = _timed(cb.publication_pdf, big, state, env, sample)
-    print("1e5 timings [s]: sample %.2f env %.2f sky %.2f 3d %.2f analysis %.2f csv %.2f pdf %.2f"
-          % (t_sample, t_env, t_sky, t_3d, t_an, t_csv, t_pdf))
+    print("1e5 timings [s]: sample %.2f env %.2f sky %.2f analysis %.2f csv %.2f pdf %.2f"
+          % (t_sample, t_env, t_sky, t_an, t_csv, t_pdf))
     assert sum(len(t.x) for t in sky.data[1:]) == N
     assert len(out[0].data) > 0 and pdf.startswith(b"%PDF") and len(csv) == N
-    for t in (t_sample, t_sky, t_3d, t_an, t_csv, t_pdf):
+    for t in (t_sample, t_sky, t_an, t_csv, t_pdf):
         assert t < LIMIT
     assert t_env < LIMIT
