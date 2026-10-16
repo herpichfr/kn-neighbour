@@ -168,6 +168,7 @@ def plot_kn_neighbour(args, data, substructures_data=None):
                     s=data['separation_k10'][mask] * 20000,
                     cmap='cool', lw=0.3)
     cb.set_clim(0.2, 1.)
+
     if substructures_data is not None:
         if 'id_group_final' in substructures_data.columns:
             substructures_data = substructures_data[substructures_data['id_group_final'] > -1]
@@ -179,7 +180,7 @@ def plot_kn_neighbour(args, data, substructures_data=None):
 
     plt.colorbar(cb, label=r'$g - r$')
     # invert x-axis
-    # ax.invert_xaxis()
+    ax.invert_xaxis()
     plt.xlabel('Right Ascension (deg)')
     plt.ylabel('Declination (deg)')
     # plt.title('k-10 Nearest Neighbours in 3D Space')
@@ -193,7 +194,7 @@ def plot_kn_neighbour(args, data, substructures_data=None):
     else:
         print("Plot not saved. Use --save_plot to save the plot.")
 
-    plt.show()
+    plt.show(block=True)
 
 
 if __name__ == "__main__":
@@ -203,12 +204,12 @@ if __name__ == "__main__":
 
     # datamap = create_average_map(data)
     # liana_substructures_filename = 'mkw4_substructures.csv'
-    liana_substructures_filename = 'MKW4_properties_concat_all_final.csv'
+    # liana_substructures_filename = 'MKW4_properties_concat_all_final.csv'
     # daniela_substructures_filename = 'MKW4_photz_Nr200_10_07292025.csv'
-    daniela_substructures_filename = 'MKW4_Nr200_10_07282025.csv'
-    substructures_file = os.path.join(os.path.dirname(
-        args.input_file), liana_substructures_filename)
-    substructures_data = load_substructures_data(substructures_file)
+    # daniela_substructures_filename = 'MKW4_Nr200_10_07282025.csv'
+    # substructures_file = os.path.join(os.path.dirname(
+    #     args.input_file), liana_substructures_filename)
+    # substructures_data = load_substructures_data(substructures_file)
 
     plot_kn_neighbour(
         # args, data, substructures_data=substructures_data)
